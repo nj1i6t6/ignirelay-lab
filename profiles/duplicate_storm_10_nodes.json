@@ -1,0 +1,14 @@
+{
+  "packet_loss_percent": 0,
+  "delay_ms_min": 10,
+  "delay_ms_max": 120,
+  "duplicate_percent": 80,
+  "reorder_percent": 40,
+  "corrupt_percent": 0,
+  "channel_busy_percent": 30,
+  "partition_windows": [],
+  "asymmetric_link": {},
+  "simultaneous_tx_collision": true,
+  "hidden_node_case": true,
+  "broadcast_storm_nodes": 10
+}
