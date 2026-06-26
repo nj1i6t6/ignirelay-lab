@@ -69,3 +69,72 @@ represent final EventEnvelope, GATT, key, MAC, checksum, or chunk formats.
   - 既有 13 測試（log_parser/scenarios）續綠；B2 新增 11 → 共 24。
 - deviations: **G13 環境偏差** — 附錄 F pin `cryptography==43.x`，但 43.x 早於 Python 3.14 無對應 wheel，本機工具鏈為 Python 3.14.1，故 `requirements.txt` pin `==47.0.0`（Ed25519/HKDF/HMAC/SHA-256 API 與 43.x 相同，且已對 corpus 逐筆驗證）。Owner 若指定 Python ≤3.12 可改回 43.x。其餘無偏差。
 - next: B3（lab FakePhone/SimNode 改跑真位元組，吃本 B2 codec）。⚠ 只記 B2 DONE，**不得**宣稱 Stage B DONE / STAGE-B-EXIT。
+
+---
+
+## [2026-06-26] B3 — lab 升級：FakePhone / SimNode 改跑真位元組 DONE
+
+- repo/commit: ignirelay-lab @ `00a480b`（本 STATUS 為其 `docs:` commit）
+- 任務: MASTER_EXECUTION_PLAN §6 B3（前置 A12/B1/B2）。lab 模擬器全面改跑**真 EventEnvelopeV2 v3 + 真 LORA-WIRE v1 位元組**，吃 B2 codec；**未改 App 任何凍結契約**（App working tree 全程 clean）、未改 gateway repo、未重生 corpus/vectors。
+- Owner 已接受 B2 G13 環境偏差（Python 3.14.1 → `cryptography==47.0.0`，B2/B3 lab 適用）。
+- 交付物（lab repo）:
+  - `ignirelay_lab/wire/compact.py`（新）：LORA-WIRE §5 緊湊 payload 翻譯/解碼（loc13 / PRESENCE 10B / SOS 22B / CHECKPOINT 10B），**逐位元組鏡像 frozen generator `generate_lora_wire_vectors.dart`**；測試對 `lora_wire_v1_vectors.json` 重現 presence/sos/checkpoint payload。
+  - `ignirelay_lab/corpus_fixtures.py`（新）：TEST-ONLY 金鑰/identity 單一來源＝App corpus `#test_field`（`IGNIRELAY_APP_DIR` 可覆寫）；重現 field_id/field_mac_key/lora_mac_key；author seed 用 corpus 的全零 `test_only_private_key_hex`。
+  - `actors.py`：**FakePhone** 真簽 v3 envelope（PRESENCE/SOS/CHECKPOINT，Ed25519 + field_mac + protocol_version=3 + 141B canonical），經 **FakeBleLink**（假 BLE 函式注入）交 SimNode；**SimNode** BLE ingest = decode→驗章(Ed25519)→驗 field_mac→expiry→去重→§5 翻譯→優先佇列（P0 插隊）；LoRa TX = 真 LORA-WIRE frame；LoRa RX = lora_v1 §8 全管線（crc/mac/ttl/replay/hlc-window）；**NODE_RECEIPT** 三態（accepted/duplicate/rejected）回 phone，語意只承諾 **PHONE_TO_NODE_ACCEPTED**（段1，§6，不冒充 HOP_ACKED/GATEWAY_CONFIRMED）。
+  - `channel.py`：FakeLoRaChannel 載**真 frame bytes**；TransmitOutcome SENT/BUSY/LOST；busy=CSMA 延遲（不耗重試預算）、loss=ACK 重試、corrupt=翻位元組（在收端由 CRC/MAC 擋，發端重送）。
+  - `model.py`：移除 `Packet`/`security_placeholder` 占位；`WirePriority`(=PriorityV2 1..6)、`QueuedEvent`、`LoraFrame`(raw bytes)、`GatewayInbound`。
+  - `scenario.py` / `cli.py`：9 情境全改真 bytes；GATE-SCEN 加**真不變量逐情境 PASS/FAIL + exit code**（非 hardcode 預期；語意判定）。
+  - `gateway_cli.py`：gateway record 由 `GatewayInbound` 真欄位生成，**移除 placeholder 欄位**（gateway repo 內部自帶預設，B4 處理）。
+  - `docs/log_schema.md`：drop_reason 改 spec 詞彙、新 layer/action、NODE_RECEIPT segment 紀律。
+- **gates（原樣指令 + exit code + 輸出）**:
+  - 原樣指令 `grep -rn "TODO_CONTRACT\|security_placeholder\|PLACEHOLDER" ignirelay_lab/` → **0 行（exit 1 = no match）**；`TODO_APP_NODE_PLACEHOLDER`/`LAB_EPOCH_PLACEHOLDER` 全 repo 亦 0。
+  - 原樣指令 `python -m unittest discover -s tests`（GATE-LAB，於 ignirelay-lab）→ **exit 0**
+    ```
+    .........................................
+    ----------------------------------------------------------------------
+    Ran 41 tests in 1.063s
+
+    OK
+
+    [B2] envelope_samples verified: 108 (signed=38, control=1)
+    [B2] negative_cases rejected: 11
+    [B2] lora negative frames: 11
+
+    [B2] lora positive frames: 51 (event=45, ack=6)
+    [B2] lora total vectors: 62
+    ```
+    （B2 既有 24 續綠；B3 新增 17 → 共 41。）
+  - 原樣指令 `python -m ignirelay_lab.cli --all`（GATE-SCEN，於 ignirelay-lab）→ **exit 0**
+    ```
+    === GATE-SCEN ===
+      [PASS] busy_sos: sos_delivery=ok delivered=2
+      [PASS] duplicate_storm_10_nodes: canonical=1 (10 relays) dedupe=ok
+      [PASS] expired_event: delivered=0 expired-rejected=logged
+      [PASS] gateway_cli: delivered=2 sos=ok
+      [PASS] gateway_reboot: canonical=1 (sqlite dedupe across restart)
+      [PASS] loss_20: sos_delivery=100% delivered=2
+      [PASS] node_reboot: delivered=1 replay-duplicate=logged
+      [PASS] normal: delivered=2 sos=ok
+      [PASS] replayed_valid_packet: delivered=1 replay-duplicate=logged
+    scenarios: 9  pass: 9  fail: 0
+    ```
+    （情境數 = 9，不減；全 PASS。）
+- **D4 壞通道 20% loss SOS 送達率**：`run_scenario("loss_20", ...)` 跨 300 seeds → **SOS delivered 300/300（missed=0）**；busy_sos 亦 300/300；無使用者可見重複（gateway 以 event_id 去重，canonical ≤ accepted）。corrupt 路徑實證：busy 情境 seed=6 `tx_corrupt=1` → 收端 `LORA_RX drop crc-mismatch=1` 且 SOS 仍送達（發端重送）。
+- **§6.1 不變量 → 測試對照表**:
+  | 不變量 | 測試 |
+  |---|---|
+  | P0/SOS preempt | `test_invariants.PriorityInvariants.test_p0_sos_preempts_lower_priority` |
+  | 最低優先（heartbeat=NORMAL）壓力下先丟 | `...PriorityInvariants.test_lowest_priority_shed_first_under_queue_pressure` |
+  | SOS 於忙線仍 preempt P3/P4 | `...PriorityInvariants.test_sos_preempts_under_busy_channel` |
+  | bounded retry（達預算即丟，不無限） | `...RetryInvariants.test_bounded_loss_retry_then_drop` |
+  | retry jitter | `...RetryInvariants.test_retry_uses_jitter` |
+  | NODE_RECEIPT 冪等（重複 envelope→DUPLICATE，佇列不增） | `...AckIdempotency.test_node_receipt_idempotent_on_duplicate_envelope` |
+  | LoRa ACK 冪等（不入去重環） | `...AckIdempotency.test_lora_ack_is_idempotent` |
+  | duplicate event_id 無 user-visible 重複（replay） | `test_scenarios.test_replayed_valid_packet_deduped` |
+  | 10 節點風暴無重複 canonical | `test_scenarios.test_duplicate_storm_single_canonical` |
+  | 真驗證（簽章/field_mac/expiry 被拒、非 stub） | `...IngestVerification.*`（4 條） |
+  | 真 CRC/MAC 擋壞幀/偽 MAC | `...LoraIntegrity.test_corrupted_frame_rejected_by_crc` / `test_forged_mac_rejected` |
+  | §5 緊湊 payload 對 frozen vectors 位元一致 | `test_compact.*`（7 條） |
+- 範圍紀律: 一刀只 B3，**未混 B4**；未碰 gateway repo（B4 才動）；B1/B2 凍結契約與 corpus/vectors 未動。
+- deviations: 沿用 B2 的 G13（`cryptography==47.0.0`，Owner 已接受）。其餘無偏差。
+- next: B4（gateway 真驗證 + 真封包）。⚠ 只記 B3 DONE，**不得**宣稱 Stage B DONE / STAGE-B-EXIT。
