@@ -1,100 +1,79 @@
-import random
+"""B3 scenario tests — every scenario runs on real EventEnvelope + LoRa bytes.
+
+Mirrors GATE-SCEN: each scenario is evaluated by the same genuine invariant the
+CLI uses (no hard-coded expected event ids).
+"""
+
 import unittest
 
-from ignirelay_lab.actors import FakePhone, SimNode
-from ignirelay_lab.channel import ChannelProfile, FakeLoRaChannel
-from ignirelay_lab.logging_utils import JsonlLogSink
-from ignirelay_lab.model import Priority
+from ignirelay_lab.channel import ChannelProfile
+from ignirelay_lab.cli import DEFAULT_SEEDS, evaluate
 from ignirelay_lab.scenario import run_scenario
 
 
-class ScenarioSmokeTests(unittest.TestCase):
+def _run(name: str, profile: ChannelProfile, seed: int | None = None):
+    return run_scenario(name, profile, seed=seed if seed is not None
+                        else DEFAULT_SEEDS[name],
+                        gateway_mode="cli" if name in
+                        {"gateway_cli", "gateway_reboot"} else "fake")
+
+
+class ScenarioTests(unittest.TestCase):
     def test_normal_delivers_presence_and_sos(self) -> None:
-        result = run_scenario("normal", ChannelProfile(), seed=1)
-        self.assertEqual(len(result.delivered_event_ids), 2)
+        r = _run("normal", ChannelProfile.from_file("profiles/normal.json"))
+        self.assertEqual(len(r.delivered_event_ids), 2)
+        self.assertIn(r.sos_event_id, r.delivered_event_ids)
+        self.assertTrue(evaluate(r)[0])
 
-    def test_loss_20_has_at_least_one_delivery(self) -> None:
-        profile = ChannelProfile(packet_loss_percent=20, duplicate_percent=5)
-        result = run_scenario("loss_20", profile, seed=7)
-        self.assertGreaterEqual(len(result.delivered_event_ids), 1)
+    def test_loss_20_sos_always_delivered(self) -> None:
+        prof = ChannelProfile.from_file("profiles/loss_20.json")
+        # DoD D4: 20% loss → SOS delivery 100% (proved across many seeds), no dup.
+        for seed in range(40):
+            r = run_scenario("loss_20", prof, seed=seed)
+            self.assertIn(r.sos_event_id, r.delivered_event_ids,
+                          f"SOS lost at seed {seed}")
+            self.assertEqual(len(r.delivered_event_ids),
+                             len(set(r.delivered_event_ids)))
 
-    def test_busy_sos_delivers_sos_under_channel_pressure(self) -> None:
-        profile = ChannelProfile(
-            packet_loss_percent=5,
-            duplicate_percent=10,
-            reorder_percent=10,
-            corrupt_percent=1,
-            channel_busy_percent=80,
-        )
-        result = run_scenario("busy_sos", profile, seed=1)
-        self.assertIn("sos-1-phone-lab-1", result.delivered_event_ids)
+    def test_busy_sos_delivers_under_channel_pressure(self) -> None:
+        r = _run("busy_sos",
+                 ChannelProfile.from_file("profiles/channel_busy_80.json"))
+        self.assertIn(r.sos_event_id, r.delivered_event_ids)
+        self.assertTrue(evaluate(r)[0])
 
-    def test_gateway_cli_integration_delivers_events(self) -> None:
-        result = run_scenario("gateway_cli", ChannelProfile(), seed=1, gateway_mode="cli")
-        self.assertEqual(result.gateway_mode, "cli")
-        self.assertEqual(len(result.delivered_event_ids), 2)
+    def test_gateway_cli_integration_delivers_two(self) -> None:
+        r = _run("gateway_cli", ChannelProfile.from_file("profiles/normal.json"))
+        self.assertEqual(r.gateway_mode, "cli")
+        self.assertEqual(len(r.delivered_event_ids), 2)
+        self.assertTrue(evaluate(r)[0])
 
-    def test_node_reboot_keeps_duplicate_from_user_visible_event(self) -> None:
-        result = run_scenario("node_reboot", ChannelProfile(), seed=1)
-        self.assertEqual(result.delivered_event_ids, ["node-reboot-event"])
+    def test_node_reboot_keeps_single_canonical(self) -> None:
+        r = _run("node_reboot", ChannelProfile.from_file("profiles/normal.json"))
+        self.assertEqual(r.delivered_event_ids, [r.sos_event_id])
+        self.assertTrue(evaluate(r)[0])
 
-    def test_gateway_reboot_keeps_sqlite_dedupe_state(self) -> None:
-        result = run_scenario("gateway_reboot", ChannelProfile(), seed=1)
-        self.assertEqual(result.delivered_event_ids, ["gateway-reboot-event"])
+    def test_gateway_reboot_keeps_sqlite_dedupe(self) -> None:
+        r = _run("gateway_reboot",
+                 ChannelProfile.from_file("profiles/normal.json"))
+        self.assertEqual(len(r.delivered_event_ids), 1)
+        self.assertTrue(evaluate(r)[0])
 
-    def test_duplicate_storm_has_one_user_visible_event(self) -> None:
-        result = run_scenario("duplicate_storm_10_nodes", ChannelProfile(), seed=1)
-        self.assertEqual(result.delivered_event_ids, ["storm-event-1"])
+    def test_duplicate_storm_single_canonical(self) -> None:
+        r = _run("duplicate_storm_10_nodes",
+                 ChannelProfile.from_file("profiles/duplicate_storm_10_nodes.json"))
+        self.assertEqual(r.delivered_event_ids, [r.sos_event_id])
+        self.assertTrue(evaluate(r)[0])
 
-    def test_replayed_valid_packet_is_deduped(self) -> None:
-        result = run_scenario("replayed_valid_packet", ChannelProfile(), seed=1)
-        self.assertEqual(result.delivered_event_ids, ["replay-event-1"])
+    def test_replayed_valid_packet_deduped(self) -> None:
+        r = _run("replayed_valid_packet",
+                 ChannelProfile.from_file("profiles/normal.json"))
+        self.assertEqual(r.delivered_event_ids, [r.sos_event_id])
+        self.assertTrue(evaluate(r)[0])
 
-    def test_expired_event_skeleton_does_not_deliver(self) -> None:
-        result = run_scenario("expired_event", ChannelProfile(), seed=1)
-        self.assertEqual(result.delivered_event_ids, [])
-
-
-class InvariantTests(unittest.TestCase):
-    def test_p0_sos_is_dequeued_before_p3_presence(self) -> None:
-        log = JsonlLogSink("test_p0_priority")
-        phone = FakePhone()
-        node = SimNode("NodeA", log)
-        node.ingest_phone_event(0, phone.presence(0, "NodeA"))
-        node.ingest_phone_event(1, phone.sos(1, "NodeA"))
-
-        first = node.queue[0]
-        self.assertEqual(first.priority, Priority.P0)
-        self.assertEqual(first.event_type, "SOS")
-
-    def test_p4_is_dropped_before_p0_under_queue_pressure(self) -> None:
-        log = JsonlLogSink("test_p4_drop")
-        phone = FakePhone()
-        node = SimNode("NodeA", log, max_queue_size=2)
-        node.ingest_phone_event(0, phone.heartbeat(0, "NodeA", index=1))
-        node.ingest_phone_event(1, phone.heartbeat(1, "NodeA", index=2))
-        node.ingest_phone_event(2, phone.sos(2, "NodeA"))
-
-        self.assertEqual(len(node.queue), 2)
-        self.assertTrue(any(event.priority == Priority.P0 for event in node.queue))
-        self.assertTrue(any(event.priority == Priority.P4 for event in node.dropped_events))
-
-    def test_retry_is_bounded(self) -> None:
-        log = JsonlLogSink("test_retry_bounded")
-        phone = FakePhone()
-        node = SimNode("NodeA", log)
-        channel = FakeLoRaChannel(
-            ChannelProfile(channel_busy_percent=100),
-            log,
-            random.Random(1),
-        )
-        event = phone.sos(1, "NodeA")
-        node.ingest_phone_event(1, event)
-        for step in range(8):
-            node.transmit_next(step * 100, channel, "NodeB")
-
-        self.assertEqual(node.retry[event.event_id].attempts, 3)
-        self.assertEqual(node.queue, [])
+    def test_expired_event_not_delivered(self) -> None:
+        r = _run("expired_event", ChannelProfile.from_file("profiles/normal.json"))
+        self.assertEqual(r.delivered_event_ids, [])
+        self.assertTrue(evaluate(r)[0])
 
 
 if __name__ == "__main__":

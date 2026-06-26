@@ -1,3 +1,10 @@
+"""Lab simulator data models (B3 — real EventEnvelope / LORA-WIRE bytes).
+
+No fake-contract placeholders: every event is a real signed EventEnvelopeV2 at
+BLE ingest and a real LORA-WIRE v1 frame on air. Scheduling priority uses the
+wire `PriorityV2` enum directly (lower number = more severe).
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -5,11 +12,20 @@ from enum import IntEnum
 from typing import Any
 
 
-class Priority(IntEnum):
-    P0 = 0
-    P1 = 1
-    P3 = 3
-    P4 = 4
+class WirePriority(IntEnum):
+    """`PriorityV2` (event_envelope_v2.dart) — lower number = more severe.
+
+    The envelope `priority` field MUST be non-zero (0 = UNSPECIFIED is rejected
+    by §3.4 required-field validation), so the lab uses the 1..6 wire values, not
+    a separate P0..P4 namespace.
+    """
+
+    SOS_RED = 1
+    SOS_YELLOW = 2
+    ALERT = 3
+    STATUS = 4
+    RESOURCE = 5
+    NORMAL = 6
 
     @property
     def label(self) -> str:
@@ -18,49 +34,83 @@ class Priority(IntEnum):
 
 @dataclass(order=True)
 class QueuedEvent:
+    """A verified event awaiting LoRa transmission (post BLE-ingest translation).
+
+    Heap order = (priority, created_ms): SOS_RED(1) is dequeued before NORMAL(6),
+    ties broken by HLC creation time (oldest first).
+    """
+
     sort_key: tuple[int, int] = field(init=False, repr=False)
     created_ms: int
-    event_id: str
-    event_type: str
-    priority: Priority
+    created_counter: int
+    envelope_id: bytes
+    event_id_hex: str
+    event_type: int          # EventTypeV2
+    priority: WirePriority
     ttl: int
-    source_node_id: str
-    payload: dict[str, Any]
+    author_key: bytes
+    compact_payload: bytes   # LORA-WIRE §5 compact payload bytes
 
     def __post_init__(self) -> None:
         self.sort_key = (int(self.priority), self.created_ms)
 
 
 @dataclass
-class Packet:
-    event_id: str
-    event_type: str
-    priority: Priority
-    ttl: int
-    packet_seq: int
+class LoraFrame:
+    """A LORA-WIRE v1 frame on the fake channel — carries REAL frame bytes.
+
+    `raw` is the byte-exact §3 frame (hdr‖body‖mac8‖crc16). Routing fields
+    (src/dst) name the simulated nodes; the logging fields are a pre-parsed view
+    so the channel can log without re-verifying. `corrupted` marks a frame the
+    channel flipped a bit in — the receiver MUST reject it via CRC/MAC.
+    """
+
+    raw: bytes
     src: str
     dst: str
-    payload: dict[str, Any]
+    event_id_hex: str
+    event_type: int
+    priority_label: str
+    ttl: int
+    packet_seq: int
     corrupted: bool = False
-    requires_ack: bool = True
-    expires_at_ms: int | None = None
-    replay_epoch: str | None = None
-    security_placeholder: str = "TODO_CONTRACT_PLACEHOLDER"
 
-    def to_gateway_record(self, now_ms: int) -> dict[str, Any]:
-        return {
-            "event_id": self.event_id,
-            "event_type": self.event_type,
-            "priority": self.priority.label,
-            "source_node_id": self.payload.get("source_node_id", self.src),
-            "last_hop_node_id": self.src,
-            "packet_seq": self.packet_seq,
-            "src": self.src,
-            "dst": self.dst,
-            "ttl": self.ttl,
-            "observed_at_ms": now_ms,
-            "expires_at_ms": self.expires_at_ms,
-            "replay_epoch": self.replay_epoch,
-            "security_placeholder": self.security_placeholder,
-            "payload_json": self.payload,
-        }
+
+@dataclass
+class GatewayInbound:
+    """A LoRa-verified event handed to the Gateway sink (Gateway = a storing node).
+
+    Built only AFTER the receiving node passed the full §8 LoRa pipeline
+    (crc/mac/ttl/replay/hlc-window). `decoded_payload` is the structured §5
+    compact decode (real data, not a placeholder).
+    """
+
+    event_id_hex: str
+    event_type: int
+    event_type_label: str
+    priority: int
+    priority_label: str
+    src_node: int
+    last_hop_label: str
+    ttl: int
+    packet_seq: int
+    hlc_ms: int
+    hlc_counter: int
+    compact_payload: bytes
+    decoded_payload: dict[str, Any]
+
+
+# EventTypeV2 → human label (logging / gateway records only).
+EVENT_TYPE_LABELS = {
+    1: "SOS",
+    3: "PRESENCE",
+    4: "CHECKPOINT",
+    50: "HAZARD",
+    82: "ADMIN_BROADCAST",
+    102: "HEARTBEAT",
+    105: "NODE_RECEIPT",
+}
+
+
+def event_type_label(event_type: int) -> str:
+    return EVENT_TYPE_LABELS.get(event_type, f"TYPE_{event_type}")

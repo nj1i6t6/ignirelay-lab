@@ -1,13 +1,32 @@
+"""Lab scenarios (B3) — every scenario runs on REAL EventEnvelope + LORA-WIRE bytes.
+
+The phone signs real v3 envelopes (corpus TEST-ONLY key); the node verifies
+signature + field_mac at BLE ingest, translates to a §5 compact LoRa payload,
+and emits real LORA-WIRE frames on the FakeLoRaChannel; the receiving node runs
+the full §8 pipeline before the Gateway sink stores a single canonical row.
+"""
+
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
-from .actors import FakeGatewaySink, FakePhone, GatewaySink, SimNode
+from . import corpus_fixtures as fx
+from .actors import (
+    RECEIPT_ACCEPTED,
+    FakeBleLink,
+    FakeGatewaySink,
+    FakePhone,
+    GatewaySink,
+    SimNode,
+)
 from .channel import ChannelProfile, FakeLoRaChannel
 from .gateway_cli import GatewayCliSink
 from .logging_utils import JsonlLogSink
-from .model import Packet, Priority
+from .model import LoraFrame, WirePriority
+from .wire import lora_v1 as lora
+
+MAIN_SOS_SCENARIOS = {"normal", "loss_20", "busy_sos", "gateway_cli"}
 
 
 @dataclass
@@ -16,6 +35,12 @@ class ScenarioResult:
     delivered_event_ids: list[str]
     log_path: str
     gateway_mode: str = "fake"
+    sos_event_id: str | None = None
+    accepted_event_ids: list[str] = field(default_factory=list)
+
+
+def _node_rng(seed: int, node_num: int) -> random.Random:
+    return random.Random(seed * 1000 + node_num)
 
 
 def run_scenario(
@@ -26,43 +51,53 @@ def run_scenario(
 ) -> ScenarioResult:
     log = JsonlLogSink(name)
     rng = random.Random(seed)
+    field_mat = fx.test_field()
     channel = FakeLoRaChannel(profile, log, rng)
     phone = FakePhone()
-    node_a = SimNode("NodeA", log)
-    node_b = SimNode("NodeB", log)
+    ble = FakeBleLink()
+    node_a = SimNode("NodeA", log, node_num=1, field=field_mat,
+                     rng=_node_rng(seed, 1))
+    node_b = SimNode("NodeB", log, node_num=2, field=field_mat,
+                     rng=_node_rng(seed, 2))
     gateway = _make_gateway(name, log, gateway_mode)
 
     if name == "node_reboot":
-        return _run_node_reboot(name, log, channel, node_a, node_b, gateway)
+        return _run_node_reboot(name, log, phone, ble, node_a, node_b, gateway)
     if name == "gateway_reboot":
-        return _run_gateway_reboot(name, log)
+        return _run_gateway_reboot(name, log, phone, ble, node_a, node_b)
     if name == "duplicate_storm_10_nodes":
-        return _run_duplicate_storm(name, log, gateway)
+        return _run_duplicate_storm(name, log, phone, ble, node_a, node_b,
+                                    gateway, field_mat)
     if name == "replayed_valid_packet":
-        return _run_replayed_valid(name, log, gateway)
+        return _run_replayed_valid(name, log, phone, ble, node_a, node_b, gateway)
     if name == "expired_event":
-        return _run_expired_event(name, log, channel, node_b, gateway)
+        return _run_expired_event(name, log, phone, ble, node_a, gateway)
 
-    now_ms = 0
-    events = [phone.presence(now_ms, "NodeA")]
-    if name in {"normal", "loss_20", "busy_sos", "gateway_cli"}:
-        events.append(phone.sos(now_ms + 1, "NodeA"))
+    # ── main store-and-forward flow: phone → NodeA (BLE) → LoRa → NodeB → GW ──
+    events = [phone.presence(0)]
+    if name in MAIN_SOS_SCENARIOS:
+        events.append(phone.sos(1))
+    sos_id = next((e.event_id_hex for e in events
+                   if e.priority == WirePriority.SOS_RED), None)
 
-    for event in events:
-        node_a.ingest_phone_event(event.created_ms, event)
+    accepted: list[str] = []
+    for e in events:
+        receipt = ble.send_envelope(node_a, 1, e.envelope_bytes)
+        if receipt.status == RECEIPT_ACCEPTED:
+            accepted.append(e.event_id_hex)
 
-    for step in range(80):
+    for step in range(160):
         now_ms = step * 100
         node_a.transmit_next(now_ms, channel, "NodeB")
-        for packet in channel.drain_ready(now_ms):
-            forwarded = node_b.receive_lora(now_ms, packet)
-            if forwarded is not None:
-                gateway.receive(now_ms, forwarded)
-        if len(gateway.events) == len(events):
+        for frame in channel.drain_ready(now_ms):
+            inbound = node_b.receive_lora(now_ms, frame, hlc_now_ms=now_ms)
+            if inbound is not None:
+                gateway.receive(now_ms, inbound)
+        if len(gateway.events) >= len(accepted):
             break
 
     gateway.finalize()
-    return _result(name, log, gateway, gateway_mode)
+    return _result(name, log, gateway, gateway_mode, sos_id, accepted)
 
 
 def _make_gateway(name: str, log: JsonlLogSink, gateway_mode: str) -> GatewaySink:
@@ -73,132 +108,107 @@ def _make_gateway(name: str, log: JsonlLogSink, gateway_mode: str) -> GatewaySin
     raise ValueError(f"unknown gateway mode: {gateway_mode}")
 
 
-def _run_node_reboot(
-    name: str,
-    log: JsonlLogSink,
-    channel: FakeLoRaChannel,
-    node_a: SimNode,
-    node_b: SimNode,
-    gateway: GatewaySink,
-) -> ScenarioResult:
-    packet = Packet(
-        event_id="node-reboot-event",
-        event_type="SOS",
-        priority=Priority.P0,
-        ttl=4,
-        packet_seq=1,
-        src="NodeA",
-        dst="NodeB",
-        payload={"contract": "TODO_APP_NODE_PLACEHOLDER", "source_node_id": "NodeA"},
-    )
-    channel.transmit(0, packet)
-    for delivered in channel.drain_ready(100):
-        forwarded = node_b.receive_lora(100, delivered)
-        if forwarded:
-            gateway.receive(100, forwarded)
+def _ingest_one_sos(phone: FakePhone, ble: FakeBleLink, node: SimNode,
+                    now_ms: int = 0):
+    sos = phone.sos(now_ms)
+    ble.send_envelope(node, now_ms, sos.envelope_bytes)
+    event = node.queue[0]
+    node.packet_seq += 1
+    frame = node.build_frame(event, "NodeB")
+    return sos, frame
+
+
+def _run_node_reboot(name, log, phone, ble, node_a, node_b, gateway):
+    sos, frame = _ingest_one_sos(phone, ble, node_a)
+    inbound = node_b.receive_lora(100, frame, hlc_now_ms=100)
+    if inbound is not None:
+        gateway.receive(100, inbound)
+    # Reboot retaining the dedupe ring → the replayed duplicate is still rejected.
     node_b.reboot(150, preserve_seen=True)
-    duplicate = Packet(**{**packet.__dict__, "packet_seq": 2})
-    forwarded = node_b.receive_lora(200, duplicate)
-    if forwarded:
-        gateway.receive(200, forwarded)
+    node_b.receive_lora(200, frame, hlc_now_ms=200)  # → replay-duplicate
     gateway.finalize()
-    return _result(name, log, gateway)
+    return _result(name, log, gateway, "fake", sos.event_id_hex,
+                   [sos.event_id_hex])
 
 
-def _run_gateway_reboot(name: str, log: JsonlLogSink) -> ScenarioResult:
-    gateway = GatewayCliSink(name, log)
-    packet = Packet(
-        event_id="gateway-reboot-event",
-        event_type="SOS",
-        priority=Priority.P0,
-        ttl=4,
-        packet_seq=1,
-        src="NodeB",
-        dst="Gateway",
-        payload={"contract": "TODO_APP_NODE_PLACEHOLDER", "source_node_id": "NodeA"},
-    )
-    gateway.receive(100, packet)
-    gateway.finalize()
+def _run_gateway_reboot(name, log, phone, ble, node_a, node_b):
+    sos, frame = _ingest_one_sos(phone, ble, node_a)
+    inbound = node_b.receive_lora(100, frame, hlc_now_ms=100)
 
-    # New sink instance, same scenario DB path: simulates process restart while
-    # SQLite keeps event_id dedupe state.
-    restarted = GatewayCliSink(name, log, reset=False)
-    duplicate = Packet(**{**packet.__dict__, "packet_seq": 2, "src": "NodeC"})
-    restarted.receive(200, duplicate)
-    restarted.finalize()
-    return _result(name, log, restarted, "cli")
+    gw1 = GatewayCliSink(name, log)
+    gw1.receive(100, inbound)
+    gw1.finalize()
+
+    # New sink, same scenario DB path: process restart while SQLite keeps the
+    # event_id dedupe state. Same event_id via a different last hop → dedupe.
+    gw2 = GatewayCliSink(name, log, reset=False)
+    gw2.receive(200, replace(inbound, last_hop_label="NodeC",
+                             packet_seq=inbound.packet_seq + 1))
+    gw2.finalize()
+    return _result(name, log, gw2, "cli", sos.event_id_hex, [sos.event_id_hex])
 
 
-def _run_duplicate_storm(name: str, log: JsonlLogSink, gateway: GatewaySink) -> ScenarioResult:
-    for index in range(10):
-        packet = Packet(
-            event_id="storm-event-1",
-            event_type="SOS",
-            priority=Priority.P0,
-            ttl=4,
-            packet_seq=index + 1,
-            src=f"Node{index}",
-            dst="Gateway",
-            payload={"contract": "TODO_APP_NODE_PLACEHOLDER", "source_node_id": "NodeA"},
+def _run_duplicate_storm(name, log, phone, ble, node_a, node_b, gateway,
+                         field_mat):
+    sos = phone.sos(0)
+    ble.send_envelope(node_a, 0, sos.envelope_bytes)
+    event = node_a.queue[0]
+    # 10 relays put the SAME event_id on air (different src_node). NodeB's dedupe
+    # ring accepts the first and rejects the other nine (replay-duplicate).
+    for i in range(10):
+        raw = lora.encode_event_frame(
+            lora_mac_key=field_mat.lora_mac_key,
+            flags=lora.FLAG_HLC_SYNCED,
+            field_tag=field_mat.field_tag,
+            src_node=10 + i,
+            packet_seq=i + 1,
+            ttl=5,
+            event_id=event.envelope_id,
+            event_type=event.event_type,
+            priority=int(event.priority),
+            hlc_ms=event.created_ms,
+            hlc_counter=event.created_counter,
+            payload=event.compact_payload,
         )
-        gateway.receive(100 + index, packet)
+        frame = LoraFrame(raw=raw, src=f"Node{10 + i}", dst="NodeB",
+                          event_id_hex=event.event_id_hex,
+                          event_type=event.event_type,
+                          priority_label=event.priority.label, ttl=5,
+                          packet_seq=i + 1)
+        inbound = node_b.receive_lora(100 + i, frame, hlc_now_ms=100 + i)
+        if inbound is not None:
+            gateway.receive(100 + i, inbound)
     gateway.finalize()
-    return _result(name, log, gateway)
+    return _result(name, log, gateway, "fake", sos.event_id_hex,
+                   [sos.event_id_hex])
 
 
-def _run_replayed_valid(name: str, log: JsonlLogSink, gateway: GatewaySink) -> ScenarioResult:
-    packet = Packet(
-        event_id="replay-event-1",
-        event_type="SOS",
-        priority=Priority.P0,
-        ttl=4,
-        packet_seq=1,
-        src="NodeB",
-        dst="Gateway",
-        payload={"contract": "TODO_APP_NODE_PLACEHOLDER", "source_node_id": "NodeA"},
-        replay_epoch="LAB_EPOCH_PLACEHOLDER",
-    )
-    gateway.receive(100, packet)
-    gateway.receive(200, Packet(**{**packet.__dict__, "packet_seq": 2}))
+def _run_replayed_valid(name, log, phone, ble, node_a, node_b, gateway):
+    sos, frame = _ingest_one_sos(phone, ble, node_a)
+    inbound = node_b.receive_lora(100, frame, hlc_now_ms=100)
+    if inbound is not None:
+        gateway.receive(100, inbound)
+    # Same valid frame replayed later → rejected by the dedupe ring.
+    node_b.receive_lora(300, frame, hlc_now_ms=300)
     gateway.finalize()
-    return _result(name, log, gateway)
+    return _result(name, log, gateway, "fake", sos.event_id_hex,
+                   [sos.event_id_hex])
 
 
-def _run_expired_event(
-    name: str,
-    log: JsonlLogSink,
-    channel: FakeLoRaChannel,
-    node_b: SimNode,
-    gateway: GatewaySink,
-) -> ScenarioResult:
-    packet = Packet(
-        event_id="expired-event-1",
-        event_type="PRESENCE",
-        priority=Priority.P3,
-        ttl=0,
-        packet_seq=1,
-        src="NodeA",
-        dst="NodeB",
-        payload={"contract": "TODO_APP_NODE_PLACEHOLDER", "source_node_id": "NodeA"},
-        expires_at_ms=50,
-    )
-    channel.transmit(100, packet)
-    forwarded = node_b.receive_lora(150, packet)
-    if forwarded:
-        gateway.receive(150, forwarded)
+def _run_expired_event(name, log, phone, ble, node_a, gateway):
+    exp = phone.expired_sos(100)
+    ble.send_envelope(node_a, 100, exp.envelope_bytes)  # → REJECTED envelope-expired
+    # Rejected at BLE ingest: never queued, never on air, never reaches gateway.
     gateway.finalize()
-    return _result(name, log, gateway)
+    return _result(name, log, gateway, "fake", exp.event_id_hex, [])
 
 
-def _result(
-    name: str,
-    log: JsonlLogSink,
-    gateway: GatewaySink,
-    gateway_mode: str = "fake",
-) -> ScenarioResult:
+def _result(name, log, gateway, gateway_mode, sos_id, accepted):
     return ScenarioResult(
         name=name,
         delivered_event_ids=sorted(gateway.events),
         log_path=str(log.path),
         gateway_mode=gateway_mode,
+        sos_event_id=sos_id,
+        accepted_event_ids=accepted,
     )

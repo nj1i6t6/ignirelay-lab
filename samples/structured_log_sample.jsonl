@@ -1,2 +1,2 @@
-{"action":"tx","dst":"NodeB","event_id":"evt-sample","extra":null,"layer":"LORA_TX","node_id":"FakeLoRaChannel","packet_seq":1,"priority":"P0","reason":"queued_for_air","rssi":null,"snr":null,"src":"NodeA","timestamp_ms":100,"ttl":6}
-{"action":"store","dst":"Gateway","event_id":"evt-sample","extra":null,"layer":"GATEWAY_RX","node_id":"Gateway","packet_seq":1,"priority":"P0","reason":"canonical_event","rssi":null,"snr":null,"src":"NodeB","timestamp_ms":200,"ttl":5}
+{"action":"tx","dst":"NodeB","event_id":"evt-sample","extra":null,"layer":"LORA_TX","node_id":"FakeLoRaChannel","packet_seq":1,"priority":"SOS_RED","reason":"queued-for-air","rssi":null,"snr":null,"src":"NodeA","timestamp_ms":100,"ttl":6}
+{"action":"store","dst":"Gateway","event_id":"evt-sample","extra":null,"layer":"GATEWAY_RX","node_id":"Gateway","packet_seq":1,"priority":"SOS_RED","reason":"canonical-event","rssi":null,"snr":null,"src":"NodeB","timestamp_ms":200,"ttl":5}

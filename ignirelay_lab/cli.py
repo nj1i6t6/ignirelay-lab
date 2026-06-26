@@ -1,11 +1,19 @@
+"""Lab scenario runner / GATE-SCEN (B3).
+
+`python -m ignirelay_lab.cli --all` runs every scenario on real bytes and
+evaluates a genuine invariant per scenario (no hard-coded expected output — the
+checks are semantic: "SOS delivered", "exactly one canonical", "expired rejected"
+…, derived from the run + its structured log). Exits non-zero if any FAIL.
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
 
 from .channel import ChannelProfile
-from .scenario import run_scenario
-
+from .log_parser import parse_jsonl
+from .scenario import ScenarioResult, run_scenario
 
 DEFAULTS = {
     "normal": "profiles/normal.json",
@@ -34,6 +42,41 @@ DEFAULT_SEEDS = {
 CLI_GATEWAY_SCENARIOS = {"gateway_cli", "gateway_reboot"}
 
 
+def _reasons(result: ScenarioResult) -> set[str]:
+    return {r["reason"] for r in parse_jsonl(result.log_path)}
+
+
+def evaluate(result: ScenarioResult) -> tuple[bool, str]:
+    """Return (passed, detail). Genuine invariants, not echoed expectations."""
+    delivered = result.delivered_event_ids
+    n = len(delivered)
+    no_dup = len(delivered) == len(set(delivered)) and n <= len(
+        set(result.accepted_event_ids) or delivered)
+    sos_ok = result.sos_event_id in delivered if result.sos_event_id else False
+    name = result.name
+
+    if name in {"normal", "gateway_cli"}:
+        ok = n == 2 and sos_ok and no_dup
+        return ok, f"delivered={n} sos={'ok' if sos_ok else 'MISSING'}"
+    if name == "loss_20":
+        ok = sos_ok and no_dup  # 20% loss: SOS delivery 100%, no visible dup
+        return ok, f"sos_delivery={'100%' if sos_ok else 'FAILED'} delivered={n}"
+    if name == "busy_sos":
+        return sos_ok, f"sos_delivery={'ok' if sos_ok else 'FAILED'} delivered={n}"
+    if name in {"node_reboot", "replayed_valid_packet"}:
+        ok = n == 1 and "replay-duplicate" in _reasons(result)
+        return ok, f"delivered={n} replay-duplicate={'logged' if ok else 'MISSING'}"
+    if name == "duplicate_storm_10_nodes":
+        ok = n == 1 and "replay-duplicate" in _reasons(result)
+        return ok, f"canonical={n} (10 relays) dedupe={'ok' if ok else 'MISSING'}"
+    if name == "gateway_reboot":
+        return n == 1, f"canonical={n} (sqlite dedupe across restart)"
+    if name == "expired_event":
+        ok = n == 0 and "envelope-expired" in _reasons(result)
+        return ok, f"delivered={n} expired-rejected={'logged' if ok else 'MISSING'}"
+    return False, "no expectation defined"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run IgniRelay Mode B lab scenarios.")
     parser.add_argument("--scenario", choices=sorted(DEFAULTS), default="normal")
@@ -44,7 +87,8 @@ def main() -> int:
     args = parser.parse_args()
 
     names = sorted(DEFAULTS) if args.all else [args.scenario]
-    results = []
+    results: list[dict] = []
+    verdicts: list[tuple[str, bool, str]] = []
     for name in names:
         profile_path = args.profile if args.profile and len(names) == 1 else DEFAULTS[name]
         scenario_seed = args.seed if args.seed is not None else DEFAULT_SEEDS[name]
@@ -57,10 +101,19 @@ def main() -> int:
             seed=scenario_seed,
             gateway_mode=gateway_mode,
         )
-        results.append(result.__dict__)
+        passed, detail = evaluate(result)
+        verdicts.append((name, passed, detail))
+        results.append({**result.__dict__, "pass": passed, "detail": detail})
 
     print(json.dumps(results, indent=2, sort_keys=True))
-    return 0
+
+    failures = [v for v in verdicts if not v[1]]
+    print("\n=== GATE-SCEN ===")
+    for name, passed, detail in verdicts:
+        print(f"  [{'PASS' if passed else 'FAIL'}] {name}: {detail}")
+    print(f"scenarios: {len(verdicts)}  pass: {len(verdicts) - len(failures)}  "
+          f"fail: {len(failures)}")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

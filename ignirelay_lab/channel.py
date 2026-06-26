@@ -1,12 +1,32 @@
+"""FakeLoRaChannel (B3) — transports REAL LORA-WIRE v1 frame bytes.
+
+Chaos (loss / busy / corruption / duplication / reorder / delay) is applied to
+the byte-exact `LoraFrame.raw`. A corrupted frame still reaches the receiver but
+with a flipped body byte, so the receiver MUST reject it via CRC/MAC (§8). Three
+transmit outcomes are distinguished so the node can model radio honestly:
+
+    SENT  — frame put on air intact.
+    BUSY  — channel busy; CSMA deferral (NOT a delivery failure → no retry budget).
+    LOST  — frame did not reach air intact (packet loss, or corrupted-in-flight);
+            the sender retransmits (bounded ACK-retry).
+"""
+
 from __future__ import annotations
 
 import json
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 
 from .logging_utils import JsonlLogSink, LogRecord
-from .model import Packet
+from .model import LoraFrame
+
+
+class TransmitOutcome(Enum):
+    SENT = "sent"
+    BUSY = "busy"
+    LOST = "lost"
 
 
 @dataclass
@@ -32,7 +52,7 @@ class ChannelProfile:
 @dataclass
 class Delivery:
     due_ms: int
-    packet: Packet
+    frame: LoraFrame
 
 
 class FakeLoRaChannel:
@@ -50,58 +70,70 @@ class FakeLoRaChannel:
     def _hit(self, percent: int) -> bool:
         return self.rng.randrange(100) < percent
 
-    def transmit(self, now_ms: int, packet: Packet) -> bool:
-        if packet.ttl <= 0:
-            self._log(now_ms, packet, "LORA_TX", "drop", "ttl_expired")
-            return False
+    def _corrupt(self, frame: LoraFrame) -> LoraFrame:
+        raw = bytearray(frame.raw)
+        # Flip a byte in the body/payload region [11, len-2) so the CRC (and then
+        # MAC) is the check that rejects it; never touch ver_ptype byte 0.
+        lo, hi = 11, max(11, len(raw) - 2)
+        idx = self.rng.randrange(lo, hi) if hi > lo else 0
+        raw[idx] ^= 0xFF
+        return replace(frame, raw=bytes(raw), corrupted=True)
+
+    def transmit(self, now_ms: int, frame: LoraFrame) -> TransmitOutcome:
+        if frame.ttl <= 0:
+            self._log(now_ms, frame, "LORA_TX", "drop", "ttl-expired")
+            return TransmitOutcome.LOST
         if self._hit(self.profile.channel_busy_percent):
-            self._log(now_ms, packet, "LORA_TX", "busy", "channel_busy")
-            return False
+            self._log(now_ms, frame, "LORA_TX", "busy", "channel-busy")
+            return TransmitOutcome.BUSY
         if self._hit(self.profile.packet_loss_percent):
-            self._log(now_ms, packet, "LORA_TX", "drop", "packet_loss")
-            return False
+            self._log(now_ms, frame, "LORA_TX", "drop", "packet-loss")
+            return TransmitOutcome.LOST
 
-        outgoing = Packet(**{**packet.__dict__})
+        delay = self.rng.randint(self.profile.delay_ms_min,
+                                 self.profile.delay_ms_max)
+
         if self._hit(self.profile.corrupt_percent):
-            outgoing.corrupted = True
-            self._log(now_ms, outgoing, "LORA_TX", "tx_corrupt", "corrupt_percent")
-        else:
-            self._log(now_ms, outgoing, "LORA_TX", "tx", "queued_for_air")
+            corrupted = self._corrupt(frame)
+            self.pending.append(Delivery(now_ms + delay, corrupted))
+            self._log(now_ms, corrupted, "LORA_TX", "tx_corrupt", "corrupt-percent")
+            self._reorder()
+            # On air but garbled → receiver drops via CRC; sender retransmits.
+            return TransmitOutcome.LOST
 
-        delay = self.rng.randint(
-            self.profile.delay_ms_min,
-            self.profile.delay_ms_max,
-        )
-        self.pending.append(Delivery(now_ms + delay, outgoing))
+        self.pending.append(Delivery(now_ms + delay, frame))
+        self._log(now_ms, frame, "LORA_TX", "tx", "queued-for-air")
 
         if self._hit(self.profile.duplicate_percent):
-            duplicate = Packet(**{**outgoing.__dict__})
-            duplicate.packet_seq = outgoing.packet_seq
-            self.pending.append(Delivery(now_ms + delay + 1, duplicate))
-            self._log(now_ms, duplicate, "LORA_TX", "duplicate", "duplicate_percent")
+            self.pending.append(Delivery(now_ms + delay + 1, frame))
+            self._log(now_ms, frame, "LORA_TX", "duplicate", "duplicate-percent")
 
+        self._reorder()
+        return TransmitOutcome.SENT
+
+    def _reorder(self) -> None:
         if self._hit(self.profile.reorder_percent):
             self.pending.sort(key=lambda item: self.rng.random())
         else:
             self.pending.sort(key=lambda item: item.due_ms)
-        return True
 
-    def drain_ready(self, now_ms: int) -> list[Packet]:
-        ready = [item.packet for item in self.pending if item.due_ms <= now_ms]
+    def drain_ready(self, now_ms: int) -> list[LoraFrame]:
+        ready = [item.frame for item in self.pending if item.due_ms <= now_ms]
         self.pending = [item for item in self.pending if item.due_ms > now_ms]
         return ready
 
-    def _log(self, now_ms: int, packet: Packet, layer: str, action: str, reason: str) -> None:
+    def _log(self, now_ms: int, frame: LoraFrame, layer: str, action: str,
+             reason: str) -> None:
         self.log.write(LogRecord(
             timestamp_ms=now_ms,
             node_id="FakeLoRaChannel",
             layer=layer,
-            event_id=packet.event_id,
-            packet_seq=packet.packet_seq,
-            src=packet.src,
-            dst=packet.dst,
-            priority=packet.priority.label,
-            ttl=packet.ttl,
+            event_id=frame.event_id_hex,
+            packet_seq=frame.packet_seq,
+            src=frame.src,
+            dst=frame.dst,
+            priority=frame.priority_label,
+            ttl=frame.ttl,
             action=action,
             reason=reason,
         ))

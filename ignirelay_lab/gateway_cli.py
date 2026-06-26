@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .logging_utils import JsonlLogSink, LogRecord
-from .model import Packet
+from .model import GatewayInbound
 
 
 def default_gateway_dir() -> Path:
@@ -34,29 +34,48 @@ class GatewayCliSink:
         self.export_json = self.base_dir / "gateway_events.json"
         self.export_csv = self.base_dir / "gateway_events.csv"
         self.events: dict[str, dict[str, Any]] = {}
-        self.routes: list[Packet] = []
+        self.routes: list[GatewayInbound] = []
         self.packet_jsonl.write_text("", encoding="utf-8")
         if reset:
             for path in (self.db_path, self.export_json, self.export_csv):
                 if path.exists():
                     path.unlink()
 
-    def receive(self, now_ms: int, packet: Packet) -> None:
-        self.routes.append(packet)
+    @staticmethod
+    def _to_record(inbound: GatewayInbound, now_ms: int) -> dict[str, Any]:
+        # Real LoRa-verified fields. No security placeholder: the security-check
+        # status the gateway records is the sibling gateway's own concern (B4);
+        # the field is omitted here so `ignirelay_lab/` carries no placeholder.
+        return {
+            "event_id": inbound.event_id_hex,
+            "event_type": inbound.event_type_label,
+            "priority": inbound.priority_label,
+            "source_node_id": f"node-{inbound.src_node}",
+            "last_hop_node_id": inbound.last_hop_label,
+            "packet_seq": inbound.packet_seq,
+            "src": inbound.last_hop_label,
+            "dst": "Gateway",
+            "ttl": inbound.ttl,
+            "observed_at_ms": now_ms,
+            "payload_json": inbound.decoded_payload,
+        }
+
+    def receive(self, now_ms: int, inbound: GatewayInbound) -> None:
+        self.routes.append(inbound)
         with self.packet_jsonl.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(packet.to_gateway_record(now_ms), sort_keys=True) + "\n")
+            handle.write(json.dumps(self._to_record(inbound, now_ms), sort_keys=True) + "\n")
         self.log.write(LogRecord(
             timestamp_ms=now_ms,
             node_id="GatewayCliSink",
             layer="GATEWAY_CLI",
-            event_id=packet.event_id,
-            packet_seq=packet.packet_seq,
-            src=packet.src,
+            event_id=inbound.event_id_hex,
+            packet_seq=inbound.packet_seq,
+            src=inbound.last_hop_label,
             dst="Gateway",
-            priority=packet.priority.label,
-            ttl=packet.ttl,
+            priority=inbound.priority_label,
+            ttl=inbound.ttl,
             action="queue_cli_ingest",
-            reason="gateway_cli_integration",
+            reason="gateway-cli-integration",
         ))
 
     def finalize(self) -> None:
