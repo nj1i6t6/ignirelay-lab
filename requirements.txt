@@ -1,0 +1,12 @@
+# IgniRelay lab — third-party dependencies (MASTER_EXECUTION_PLAN 附錄 F / G13).
+#
+# Only `cryptography` is whitelisted for the lab (stdlib has no Ed25519). It
+# provides Ed25519 verify + HKDF-SHA256; HMAC/SHA-256/CRC use the stdlib.
+#
+# 附錄 F pins `cryptography==43.x`. That release line predates Python 3.14 and
+# ships no 3.14 wheel; the local toolchain is Python 3.14.1, so we pin the 47.x
+# line, whose Ed25519 / HKDF / HMAC / SHA-256 APIs are identical to 43.x and are
+# proven against the committed corpora by the B2 conformance tests. This is a
+# G13 environment-driven deviation recorded in STATUS.md (B2); Owner may re-pin
+# to 43.x if a Python ≤3.12 interpreter is mandated for the lab.
+cryptography==47.0.0
