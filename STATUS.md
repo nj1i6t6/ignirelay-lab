@@ -138,3 +138,24 @@ represent final EventEnvelope, GATT, key, MAC, checksum, or chunk formats.
 - 範圍紀律: 一刀只 B3，**未混 B4**；未碰 gateway repo（B4 才動）；B1/B2 凍結契約與 corpus/vectors 未動。
 - deviations: 沿用 B2 的 G13（`cryptography==47.0.0`，Owner 已接受）。其餘無偏差。
 - next: B4（gateway 真驗證 + 真封包）。⚠ 只記 B3 DONE，**不得**宣稱 Stage B DONE / STAGE-B-EXIT。
+
+---
+
+## [2026-06-27] B4 — lab gateway_cli E2E 改送真 LoRa 幀（B4 一部分）— 執行者：Claude（主理 AI session）
+
+- repo/commit: ignirelay-lab `ffd79dc`（`[B4] lab gateway_cli E2E sends real LoRa frames`）／本 STATUS commit。
+  gateway 端主刀於 gateway repo `aa70db5`（見該 repo STATUS B4 條目）。
+- 範圍: B4 的 E2E glue（task #6）。lab 的 `gateway_cli`/`gateway_reboot` 情境改把**位元精確的在空 LoRa 幀**
+  交給 sibling gateway，由 gateway **自行**重驗 mac8/crc16/ttl（真驗證），取代先前的「解碼記錄」交接。
+- 交付:
+  - `model.py`：`GatewayInbound` 加 `raw_frame`（節點驗過的在空幀 bytes）。
+  - `actors.py`：`_to_gateway` 把 `frame.raw` 帶進 inbound。
+  - `gateway_cli.py`：`_to_record` 改發 `{frame_hex, last_hop_node_id, observed_at_ms}`；
+    `_write_test_config` 寫 **TEST-ONLY** `gateway_config.test.json`（corpus `field_join_secret` b64，落在
+    gitignored `logs/` 下，**非** production 憑證），ingest 以 `--config` 帶入讓 gateway 能驗場域 HMAC。
+- gates（原樣指令 + exit code）:
+  - `python -m unittest discover -s tests`（GATE-LAB）→ **exit 0**，`Ran 41 tests ... OK`（不減）。
+  - `python -m ignirelay_lab.cli --all`（GATE-SCEN）→ **exit 0**，**9/9 PASS**（情境數不減）；
+    gateway_cli `delivered=2`、gateway_reboot `canonical=1`（sqlite dedupe across restart）皆走真 gateway 驗證。
+- 紅線: 未碰 App / gateway frozen contracts 與 corpus/vectors；secret 僅 TEST-ONLY 且不入版控；
+  僅做 B4 E2E glue，**未宣稱 Stage B DONE / STAGE-B-EXIT**。
