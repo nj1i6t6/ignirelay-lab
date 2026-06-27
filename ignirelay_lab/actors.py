@@ -498,9 +498,10 @@ class SimNode:
         self._log(now_ms, frame.event_id_hex, parsed.packet_seq, frame.src,
                   self.node_id, WirePriority(parsed.priority).label, parsed.ttl,
                   "LORA_RX", "rx", "frame-verified")
-        return self._to_gateway(now_ms, parsed)
+        return self._to_gateway(now_ms, parsed, frame.raw)
 
-    def _to_gateway(self, now_ms: int, parsed: lora.LoraParsedFrame) -> GatewayInbound:
+    def _to_gateway(self, now_ms: int, parsed: lora.LoraParsedFrame,
+                    raw_frame: bytes) -> GatewayInbound:
         decoded = _decode_compact(parsed.event_type, parsed.payload)
         return GatewayInbound(
             event_id_hex=parsed.event_id.hex(),
@@ -516,6 +517,7 @@ class SimNode:
             hlc_counter=parsed.hlc_counter,
             compact_payload=parsed.payload,
             decoded_payload=decoded,
+            raw_frame=raw_frame,
         )
 
     def reboot(self, now_ms: int, preserve_seen: bool = True) -> None:

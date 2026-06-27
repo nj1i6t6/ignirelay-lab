@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -7,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import corpus_fixtures as fx
 from .logging_utils import JsonlLogSink, LogRecord
 from .model import GatewayInbound
 
@@ -33,6 +35,7 @@ class GatewayCliSink:
         self.db_path = self.base_dir / "gateway.sqlite"
         self.export_json = self.base_dir / "gateway_events.json"
         self.export_csv = self.base_dir / "gateway_events.csv"
+        self.config_json = self.base_dir / "gateway_config.test.json"
         self.events: dict[str, dict[str, Any]] = {}
         self.routes: list[GatewayInbound] = []
         self.packet_jsonl.write_text("", encoding="utf-8")
@@ -43,22 +46,28 @@ class GatewayCliSink:
 
     @staticmethod
     def _to_record(inbound: GatewayInbound, now_ms: int) -> dict[str, Any]:
-        # Real LoRa-verified fields. No security placeholder: the security-check
-        # status the gateway records is the sibling gateway's own concern (B4);
-        # the field is omitted here so `ignirelay_lab/` carries no placeholder.
+        # B4 E2E: hand the gateway the byte-exact on-air LoRa frame so it
+        # re-verifies (mac8/crc16/ttl) the real bytes itself. `local_est_ms` is
+        # intentionally omitted (bootstrap/un-synced gateway → §8 skips the HLC
+        # window; the frames are honest and within budget anyway).
         return {
-            "event_id": inbound.event_id_hex,
-            "event_type": inbound.event_type_label,
-            "priority": inbound.priority_label,
-            "source_node_id": f"node-{inbound.src_node}",
+            "frame_hex": inbound.raw_frame.hex(),
             "last_hop_node_id": inbound.last_hop_label,
-            "packet_seq": inbound.packet_seq,
-            "src": inbound.last_hop_label,
-            "dst": "Gateway",
-            "ttl": inbound.ttl,
             "observed_at_ms": now_ms,
-            "payload_json": inbound.decoded_payload,
         }
+
+    def _write_test_config(self) -> Path:
+        """Write a TEST-ONLY gateway config so the sibling gateway can verify the
+        field HMAC. The secret is the corpus TEST-ONLY field_join_secret (same one
+        the frames are signed with); the file lives under the gitignored logs/
+        dir and is NOT a production credential."""
+        secret_b64 = base64.b64encode(fx.test_field().secret).decode()
+        self.config_json.write_text(json.dumps({
+            "field_secrets_b64": [secret_b64],
+            "admin_token": "TEST-ONLY-LAB-NOT-A-REAL-TOKEN",
+            "db_path": str(self.db_path.resolve()),
+        }, indent=2), encoding="utf-8")
+        return self.config_json
 
     def receive(self, now_ms: int, inbound: GatewayInbound) -> None:
         self.routes.append(inbound)
@@ -84,7 +93,9 @@ class GatewayCliSink:
         if not self.gateway_dir.exists():
             raise RuntimeError(f"Gateway repo not found: {self.gateway_dir}")
 
-        self._run_gateway("ingest", "--input", str(self.packet_jsonl.resolve()))
+        config = self._write_test_config()
+        self._run_gateway("ingest", "--input", str(self.packet_jsonl.resolve()),
+                          config=config)
         self._run_gateway(
             "export",
             "--json",
@@ -95,15 +106,17 @@ class GatewayCliSink:
         rows = json.loads(self.export_json.read_text(encoding="utf-8"))
         self.events = {row["event_id"]: row for row in rows}
 
-    def _run_gateway(self, *args: str) -> None:
+    def _run_gateway(self, *args: str, config: Path | None = None) -> None:
         command = [
             sys.executable,
             "-m",
             "ignirelay_gateway.cli",
             "--db",
             str(self.db_path.resolve()),
-            *args,
         ]
+        if config is not None:
+            command += ["--config", str(config.resolve())]
+        command += list(args)
         subprocess.run(
             command,
             cwd=self.gateway_dir,

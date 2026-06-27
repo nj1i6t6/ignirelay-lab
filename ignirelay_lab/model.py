@@ -82,7 +82,9 @@ class GatewayInbound:
 
     Built only AFTER the receiving node passed the full §8 LoRa pipeline
     (crc/mac/ttl/replay/hlc-window). `decoded_payload` is the structured §5
-    compact decode (real data, not a placeholder).
+    compact decode (real data, not a placeholder). `raw_frame` is the byte-exact
+    on-air LORA-WIRE frame the node verified — the B4 gateway re-verifies these
+    exact bytes independently (E2E), so it must travel with the inbound.
     """
 
     event_id_hex: str
@@ -98,6 +100,7 @@ class GatewayInbound:
     hlc_counter: int
     compact_payload: bytes
     decoded_payload: dict[str, Any]
+    raw_frame: bytes = b""
 
 
 # EventTypeV2 → human label (logging / gateway records only).
