@@ -25,6 +25,7 @@ DEFAULTS = {
     "duplicate_storm_10_nodes": "profiles/duplicate_storm_10_nodes.json",
     "replayed_valid_packet": "profiles/normal.json",
     "expired_event": "profiles/normal.json",
+    "e2e_real_stack": "profiles/normal.json",  # profile unused (real node exes)
 }
 
 DEFAULT_SEEDS = {
@@ -37,6 +38,7 @@ DEFAULT_SEEDS = {
     "duplicate_storm_10_nodes": 7,
     "replayed_valid_packet": 7,
     "expired_event": 7,
+    "e2e_real_stack": 7,
 }
 
 CLI_GATEWAY_SCENARIOS = {"gateway_cli", "gateway_reboot"}
@@ -74,6 +76,19 @@ def evaluate(result: ScenarioResult) -> tuple[bool, str]:
     if name == "expired_event":
         ok = n == 0 and "envelope-expired" in _reasons(result)
         return ok, f"delivered={n} expired-rejected={'logged' if ok else 'MISSING'}"
+    if name == "e2e_real_stack":
+        if result.e2e_skipped:
+            return True, f"SKIPPED ({result.e2e_skipped})"
+        pres_ok = result.presence_event_id in delivered
+        sos_only_once = sos_ok and n == 2 and no_dup
+        order_ok = bool(result.e2e_sos_before_presence)
+        receipts_ok = (result.e2e_nodeA_receipts or 0) >= 1
+        restart_ok = bool(result.e2e_no_dup_after_restart)
+        ok = pres_ok and sos_only_once and order_ok and receipts_ok and restart_ok
+        return ok, (f"presence={'ok' if pres_ok else 'MISS'} sos={'ok' if sos_ok else 'MISS'} "
+                    f"canonical={n} sos<presence={order_ok} "
+                    f"nodeA_receipts={result.e2e_nodeA_receipts} "
+                    f"no_dup_after_restart={restart_ok}")
     return False, "no expectation defined"
 
 

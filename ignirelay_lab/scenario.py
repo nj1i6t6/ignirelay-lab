@@ -37,6 +37,12 @@ class ScenarioResult:
     gateway_mode: str = "fake"
     sos_event_id: str | None = None
     accepted_event_ids: list[str] = field(default_factory=list)
+    # e2e_real_stack (B7) extras — JSON-scalar so the cli can dump the result.
+    presence_event_id: str | None = None
+    e2e_sos_before_presence: bool | None = None
+    e2e_no_dup_after_restart: bool | None = None
+    e2e_nodeA_receipts: int | None = None
+    e2e_skipped: str | None = None
 
 
 def _node_rng(seed: int, node_num: int) -> random.Random:
@@ -61,6 +67,8 @@ def run_scenario(
                      rng=_node_rng(seed, 2))
     gateway = _make_gateway(name, log, gateway_mode)
 
+    if name == "e2e_real_stack":
+        return _run_e2e_real_stack(name, seed)
     if name == "node_reboot":
         return _run_node_reboot(name, log, phone, ble, node_a, node_b, gateway)
     if name == "gateway_reboot":
@@ -201,6 +209,34 @@ def _run_expired_event(name, log, phone, ble, node_a, gateway):
     # Rejected at BLE ingest: never queued, never on air, never reaches gateway.
     gateway.finalize()
     return _result(name, log, gateway, "fake", exp.event_id_hex, [])
+
+
+def _run_e2e_real_stack(name: str, seed: int) -> ScenarioResult:
+    """B7: drive the real B6 node executables; adapt the rich E2EResult to a
+    ScenarioResult so GATE-SCEN can evaluate it like any other scenario."""
+    from .e2e_real_stack import run_e2e_real_stack
+
+    r = run_e2e_real_stack(name, seed=seed)
+    if r.skipped:
+        return ScenarioResult(name=name, delivered_event_ids=[],
+                              log_path=r.log_path, gateway_mode="cli",
+                              sos_event_id=r.sos_event_id or None,
+                              e2e_skipped=r.skipped)
+    order = r.feed_event_order
+    big = 10 ** 9
+    sos_before = (order.index(r.sos_event_id) if r.sos_event_id in order else big) \
+        < (order.index(r.presence_event_id) if r.presence_event_id in order else big)
+    no_dup = (set(r.gateway_events_after_restart) == set(r.gateway_events)
+              and len(r.gateway_events_after_restart) == len(r.gateway_events))
+    return ScenarioResult(
+        name=name, delivered_event_ids=sorted(r.gateway_events.keys()),
+        log_path=r.log_path, gateway_mode="cli", sos_event_id=r.sos_event_id,
+        accepted_event_ids=sorted(r.gateway_events.keys()),
+        presence_event_id=r.presence_event_id,
+        e2e_sos_before_presence=sos_before,
+        e2e_no_dup_after_restart=no_dup,
+        e2e_nodeA_receipts=r.nodeA_node_receipts,
+    )
 
 
 def _result(name, log, gateway, gateway_mode, sos_id, accepted):
