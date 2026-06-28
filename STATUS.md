@@ -159,3 +159,26 @@ represent final EventEnvelope, GATT, key, MAC, checksum, or chunk formats.
     gateway_cli `delivered=2`、gateway_reboot `canonical=1`（sqlite dedupe across restart）皆走真 gateway 驗證。
 - 紅線: 未碰 App / gateway frozen contracts 與 corpus/vectors；secret 僅 TEST-ONLY 且不入版控；
   僅做 B4 E2E glue，**未宣稱 Stage B DONE / STAGE-B-EXIT**。
+
+---
+
+## [2026-06-28] B6 support — C 向量生成器 `tools/gen_c_vectors.py`（B6 一部分）— 執行者：Claude（主理 AI session）
+
+- repo/commit: ignirelay-lab `35aed3f`（`[B6] gen_c_vectors generator + test`）／本 STATUS commit。
+  field-node 主刀於 field-node repo `0817245`（見該 repo STATUS B6 條目）。
+- 範圍: MASTER §6 B6 步驟1「lab 提供 `tools/gen_c_vectors.py` 把 vectors 轉 field-node `.inc`」。
+- 交付:
+  - `tools/gen_c_vectors.py`：讀 App 凍結 `docs/specs/lora_wire_v1_vectors.json` 與
+    `wire_conformance_v1.json`（envelope_samples，event_type∈{1,50} 之 BLE-ingest 子集），輸出
+    field-node `tests/wire/lora_vectors.inc`（51 正 + 11 負）與 `envelope_vectors.inc`（33 canonical +
+    10 signed + 3 typed），檔頭標「GENERATED — DO NOT EDIT」。**REGENERATE 無契約、不重生 App corpus**：
+    所有期望值（frame/mac8/crc16/drop_reason、canonical/signature/field_mac/payload_sha256/keys）逐字
+    自 App JSON 複製；唯一計算物是 decoder 輸入用的 EventEnvelopeV2 protobuf（由 B2 reference
+    `envelope_v3.encode` 產生，正確性錨定於 corpus 期望 canonical/sig/field_mac）。`--check` 偵測 drift。
+  - `tests/test_gen_c_vectors.py`：守衛 committed `.inc` 與生成器 in-sync、§8.1 drop_reason 詞彙全覆蓋、
+    子集計數（33/10/3）、確定性、不偽造 PRESENCE(3)/CHECKPOINT(4)（corpus 無此型別 → 子集只 STATUS(1)+HAZARD(50)）。
+- gates（原樣指令 + exit code）:
+  - `python -m tools.gen_c_vectors --check` → exit 0（committed .inc in-sync）。
+  - `python -m unittest discover -s tests`（GATE-LAB）→ exit 0，`Ran 45 tests ... OK`（B2/B3 41 + 本刀 +4）。
+- 紅線: 未碰 App / gateway frozen contracts 與 corpus/vectors（App working tree 全程 0 changed）；
+  僅做 B6 的 lab 生成器部分，**未宣稱 Stage B DONE / STAGE-B-EXIT**。
