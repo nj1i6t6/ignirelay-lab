@@ -182,3 +182,56 @@ represent final EventEnvelope, GATT, key, MAC, checksum, or chunk formats.
   - `python -m unittest discover -s tests`（GATE-LAB）→ exit 0，`Ran 45 tests ... OK`（B2/B3 41 + 本刀 +4）。
 - 紅線: 未碰 App / gateway frozen contracts 與 corpus/vectors（App working tree 全程 0 changed）；
   僅做 B6 的 lab 生成器部分，**未宣稱 Stage B DONE / STAGE-B-EXIT**。
+
+---
+
+## [2026-06-28] B7 — 模擬端到端 `e2e_real_stack`（跑真 B6 C 執行檔）— 執行者：Claude（主理 AI session）
+
+- repo/commit: ignirelay-lab `c38a071`（code）／本 STATUS commit。搭配 field-node B7 支援
+  （PRESENCE 轉發 + UDP runtime，field-node repo `4b33257`，見該 repo STATUS B7 條目）。
+- 範圍: MASTER §6 B7「模擬端到端」。**不在 Python 重新實作 node 邏輯**——以 2 個子行程啟動
+  field-node B6 `zephyr.exe`（bsim native）真執行檔；Python 只做 UDP hub（FakeLoRaChannel）、
+  FakePhone 真簽 envelope 注入、與 B4 gateway 真驗證 sink。
+
+### 拓樸
+```
+FakePhone(真簽 EventEnvelopeV2 v3) --BLE(UDP)--> NodeA(真 C exe)
+   --LoRa(UDP hub 搬真 LORA-WIRE bytes)--> NodeB(真 C exe)
+   hub 每個 on-air frame tap --> Gateway(B4 真驗證+去重 by canonical event_id)
+```
+
+### 交付（lab）
+- `ignirelay_lab/e2e_real_stack.py`（新）：
+  - `NodeProcess`：spawn B6 exe（**nrf_bsim 單槓 `-opt=value` 參數**：`-lora-hub=ip:port`
+    `-node-id` `-node-port` `-ble-port` `-field-secret`〔corpus TEST-ONLY，不入版控〕；`-nosim` standalone）。
+  - `LoRaUdpHub`：綁 127.0.0.1:9300，frame 扇出到其他 node 埠（共享介質 → NodeA+NodeB 都被 gateway
+    聽到 → 真多跳重複進 B4 去重）；每 frame tap 進 gateway feed（`{frame_hex,last_hop_node_id,observed_at_ms}`）。
+  - `inject_ble`：`[anon8(8)][len u16 LE][envelope]*` 批次經 BLE-UDP 注入 NodeA。
+  - `ingest_feed`：沿用 B4 gateway CLI（`ingest`+`export`，TEST-ONLY `--config` 帶場域 HMAC，
+    DB 跨呼叫保留→斷言⑤重啟後驗無重複 canonical）。
+  - `count_node_receipt_emits`：逐行匹配 `layer=NODE_RECEIPT` ∧ `action=emit`（log 行欄位非相鄰）。
+- `ignirelay_lab/scenario.py` / `cli.py`：接 `e2e_real_stack` 進 GATE-SCEN；evaluate() 真不變量
+  （presence∈canonical ∧ sos∈canonical ∧ n==2 ∧ 無重複 ∧ sos 先於 presence ∧ nodeA_receipts≥1 ∧
+  重啟後無新 canonical）。exe 不在則 SKIP（純 Python 情境仍跑）。
+- `tests/test_e2e_real_stack.py`（新）：5 斷言一條一 test（exe 缺則 skipUnless）。
+
+### 5 斷言（檔名:行號）— `tests/test_e2e_real_stack.py`
+1. `test_presence_exactly_one_canonical` — **L46**：PRESENCE 到 Gateway SQLite 恰一筆 canonical。
+2. `test_sos_exactly_one_canonical` — **L57**：SOS(RED) 恰一筆 canonical（多跳多幀去重成一）。
+3. `test_sos_arrives_before_presence` — **L68**：同窗 SOS（prio1）先於 P3 PRESENCE（prio3）到 gateway。
+4. `test_nodeA_emits_node_receipt` — **L78**：NodeA log 有 `NODE_RECEIPT ... action=emit` 發出記錄。
+5. `test_nodeB_restart_no_duplicate_canonical` — **L90**：殺 NodeB 重啟 + replay 後 Gateway 無重複 canonical。
+
+### gates（原樣指令 + exit code；WSL2 Ubuntu，venv python 有 cryptography，IGNIRELAY_NODE_EXE=bsim zephyr.exe）
+```
+python -m ignirelay_lab.cli --scenario e2e_real_stack  -> exit 0
+   [PASS] e2e_real_stack: presence=ok sos=ok canonical=2 sos<presence=True nodeA_receipts=2 no_dup_after_restart=True
+python -m ignirelay_lab.cli --all (GATE-SCEN)           -> exit 0  ->  10/10 PASS（含 e2e_real_stack）
+python -m unittest discover -s tests (GATE-LAB)         -> exit 0  ->  Ran 50 tests OK（B6 45 + B7 +5）
+# 旁證未回歸：gateway repo GATE-GW python -m unittest discover -s tests -> exit 0 Ran 26 OK（B4 未動）
+# field-node 4 build 全 EXIT=0（見 field-node STATUS B7）；exe 由同源 pristine rebuild、E2E 對新 binary 仍 PASS
+```
+
+- 紅線: 未碰 App frozen contracts / corpus / vectors（App working tree 全程 0 changed）；
+  gateway repo 0 changed（沿用 B4 sink）；**未在 Python 假裝 E2E——跑真 B6 C 執行檔**；
+  secret 僅 TEST-ONLY 不入版控；**只記 B7 DONE，未宣稱 Stage B DONE / STAGE-B-EXIT，未進 B8**。
