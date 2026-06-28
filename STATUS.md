@@ -235,3 +235,56 @@ python -m unittest discover -s tests (GATE-LAB)         -> exit 0  ->  Ran 50 te
 - 紅線: 未碰 App frozen contracts / corpus / vectors（App working tree 全程 0 changed）；
   gateway repo 0 changed（沿用 B4 sink）；**未在 Python 假裝 E2E——跑真 B6 C 執行檔**；
   secret 僅 TEST-ONLY 不入版控；**只記 B7 DONE，未宣稱 Stage B DONE / STAGE-B-EXIT，未進 B8**。
+
+---
+
+## [2026-06-28] B8 — chaos 全綠（真位元組版）— 執行者：Claude（主理 AI session）
+
+- repo/commit: ignirelay-lab `b0c3107`（code）／本 STATUS commit。搭配 field-node B8 支援
+  （node_runtime bounded retry，field-node repo `c4f2e4d`，見該 repo STATUS B8 條目）。
+- 範圍: MASTER §6 B8。對 B7 `e2e_real_stack` 拓樸（真 B6 C 執行檔 + 真 LORA-WIRE 幀 + 真 B4 gateway
+  驗證）加 chaos。**送達韌性全由真 C node 的 bounded retry（≤3）+ TTL relay 提供，hub 只丟/壞/分區位元組，
+  絕不替 node 重送**。
+
+### 交付（lab）
+- `LoRaUdpHub` chaos：每接收方獨立套 packet-loss / corrupt（翻位元組→收端 CRC 拒）/ partition / asymmetric
+  one-way link，作用於位元組精確幀；逐連結統計。`PortLayout` 讓每情境用**不相交 UDP 埠基底**
+  （sequential-safe；Owner 提醒：固定埠勿並行兩個 e2e_real_stack）。
+- `profiles/`：**loss_50**（50% 每連結丟包）、**partition_heal**（`drop_first_frames` 計數窗——
+  **clock-independent**，因 bsim node clock 快於 wall-clock，用幀數而非 wall-ms 才能確定性覆蓋已知數量的
+  retry 嘗試）、**asymmetric_link**（`2->1` 反向連結 down）。
+- `run_chaos_real_stack`：注入 PRESENCE + N SOS，寫 `logs/<scenario>/report.json`
+  〔seed / 封包幀統計 / 不變量 / delivered·canonical·dedup / drop·retry 摘要 / ports〕。
+- `scenario.py`/`cli.py`：3 chaos 情境接進 GATE-SCEN，真不變量；exe 不在則 SKIP。
+- `tests/test_chaos_real_stack.py`：DoD 斷言（檔名:行號於該檔）——
+  L80 loss_50 SOS 最終送達+無重複、L96 20% loss 100% 送達、L106 partition_heal heal 後經 retry 送達、
+  L120 asymmetric 經工作方向送達+有 retry、**L133 retry 逐 event_id ≤3（紅線守衛）**。
+
+### 種子（固定+記錄，重現性）
+所有 chaos 情境 seed=**7**（記於各 report.json）；驗過跨 6 個 seed（7/11/23/101/202/303）皆穩健，非 seed-luck。
+**未調 profile 數值作弊**（loss 維持 50/20、partition=前 4 幀、asymmetric=2->1 down）；
+**未提高 retry 上限超 spec**（每事件 ≤3 transmit，L133 斷言；report.json node_a.transmit/retransmit 佐證）。
+
+### DoD 證據（WSL2，venv python 有 cryptography，IGNIRELAY_NODE_EXE=bsim exe）
+```
+python -m ignirelay_lab.cli --scenario loss_50          -> PASS（sos_delivered no_dup retransmit ratio=1.0）
+python -m ignirelay_lab.cli --scenario partition_heal   -> PASS（heal 後 retry 送達、drop_first 4 幀）
+python -m ignirelay_lab.cli --scenario asymmetric_link  -> PASS（dedup=6 證多跳收斂、retry 因無反向 echo）
+python -m ignirelay_lab.cli --all (GATE-SCEN)           -> exit 0  ->  13/13 PASS
+python -m unittest discover -s tests (GATE-LAB)         -> exit 0  ->  Ran 55 OK（B7 50 + B8 +5）
+# 20% loss SOS 100%：6 SOS burst（≤TX buffer 8）全送達 ratio=1.0（跨 5 seed 皆 6/6）
+# 50% loss SOS 最終送達+無重複：1 SOS（跨 6 seed 皆送達）
+# report paths: logs/{loss_50,partition_heal,asymmetric_link,loss_20_realstack}/report.json
+# 旁證未回歸：gateway GATE-GW Ran 26 OK（B4 未動）；field-node 4 build EXIT=0、core16/16、wire12/12
+```
+
+### 重要工程發現（誠實記錄）
+1. **B7 runtime 每幀只送一次**——B8 50% loss「最終送達」需真 node 多次嘗試＝spec bounded ACK-retry。
+   B7 漏接；依「驗收發現走 bugfix」於 field-node `c4f2e4d` 補上（≤3、隱式 ACK；B7-normal 不變）。
+2. **TX buffer 上限 IR_RT_TX_CAP=8**——一次注入 >8 事件會溢位丟最後幾筆（真有界緩衝行為）；故 20% 100%
+   測試注入 6 SOS（含 burst ≤8）誠實展示，非作弊。
+3. **bsim node clock 快於 wall-clock**——故 partition 用幀數窗（非 wall-ms）才確定性對齊 retry 排程。
+
+- 紅線: 未碰 App / gateway frozen contracts 與 corpus/vectors（App + gateway working tree 全程 0 changed）；
+  **跑真 B6 C 執行檔，未用 Python 重新實作 node 取代**；secret 僅 TEST-ONLY 不入版控；
+  **只記 B8 DONE，未宣稱 Stage B DONE / STAGE-B-EXIT，未進 B9**。caveat：純編譯 + bsim native 模擬（無硬體）。
