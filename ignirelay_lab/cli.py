@@ -26,6 +26,10 @@ DEFAULTS = {
     "replayed_valid_packet": "profiles/normal.json",
     "expired_event": "profiles/normal.json",
     "e2e_real_stack": "profiles/normal.json",  # profile unused (real node exes)
+    # B8 chaos — real node exes; profile drives the hub's per-link chaos.
+    "loss_50": "profiles/loss_50.json",
+    "partition_heal": "profiles/partition_heal.json",
+    "asymmetric_link": "profiles/asymmetric_link.json",
 }
 
 DEFAULT_SEEDS = {
@@ -39,9 +43,14 @@ DEFAULT_SEEDS = {
     "replayed_valid_packet": 7,
     "expired_event": 7,
     "e2e_real_stack": 7,
+    # B8 chaos seeds are fixed for reproducibility (recorded in report.json).
+    "loss_50": 7,
+    "partition_heal": 7,
+    "asymmetric_link": 7,
 }
 
 CLI_GATEWAY_SCENARIOS = {"gateway_cli", "gateway_reboot"}
+CHAOS_SCENARIOS = {"loss_50", "partition_heal", "asymmetric_link"}
 
 
 def _reasons(result: ScenarioResult) -> set[str]:
@@ -89,6 +98,20 @@ def evaluate(result: ScenarioResult) -> tuple[bool, str]:
                     f"canonical={n} sos<presence={order_ok} "
                     f"nodeA_receipts={result.e2e_nodeA_receipts} "
                     f"no_dup_after_restart={restart_ok}")
+    if name in CHAOS_SCENARIOS:
+        if result.chaos_skipped:
+            return True, f"SKIPPED ({result.chaos_skipped})"
+        delivered = bool(result.chaos_sos_delivered)
+        no_dup = bool(result.chaos_no_dup)
+        ok = delivered and no_dup
+        # partition_heal & asymmetric_link additionally require that the real node
+        # actually retransmitted (the first attempts were dropped) — proving the
+        # delivery came from bounded retry, not a lucky single shot.
+        if name in {"partition_heal", "asymmetric_link"}:
+            ok = ok and bool(result.chaos_retransmitted)
+        return ok, (f"sos_delivered={delivered} no_dup={no_dup} "
+                    f"retransmit={result.chaos_retransmitted} "
+                    f"ratio={result.chaos_sos_ratio}")
     return False, "no expectation defined"
 
 

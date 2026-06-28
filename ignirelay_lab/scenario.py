@@ -43,6 +43,16 @@ class ScenarioResult:
     e2e_no_dup_after_restart: bool | None = None
     e2e_nodeA_receipts: int | None = None
     e2e_skipped: str | None = None
+    # chaos (B8) extras — real-stack run under a ChannelProfile.
+    chaos_report_path: str | None = None
+    chaos_sos_delivered: bool | None = None
+    chaos_no_dup: bool | None = None
+    chaos_retransmitted: bool | None = None
+    chaos_sos_ratio: float | None = None
+    chaos_skipped: str | None = None
+
+
+CHAOS_SCENARIOS = {"loss_50", "partition_heal", "asymmetric_link"}
 
 
 def _node_rng(seed: int, node_num: int) -> random.Random:
@@ -69,6 +79,8 @@ def run_scenario(
 
     if name == "e2e_real_stack":
         return _run_e2e_real_stack(name, seed)
+    if name in CHAOS_SCENARIOS:
+        return _run_chaos(name, profile, seed)
     if name == "node_reboot":
         return _run_node_reboot(name, log, phone, ble, node_a, node_b, gateway)
     if name == "gateway_reboot":
@@ -236,6 +248,32 @@ def _run_e2e_real_stack(name: str, seed: int) -> ScenarioResult:
         e2e_sos_before_presence=sos_before,
         e2e_no_dup_after_restart=no_dup,
         e2e_nodeA_receipts=r.nodeA_node_receipts,
+    )
+
+
+def _run_chaos(name: str, profile: ChannelProfile, seed: int) -> ScenarioResult:
+    """B8: drive the real B6 node executables under a chaos profile and adapt the
+    rich ChaosResult to a ScenarioResult. Delivery resilience is the real C node's
+    bounded retry + relay; the hub only loses/corrupts/partitions bytes."""
+    from .e2e_real_stack import run_chaos_real_stack
+
+    r = run_chaos_real_stack(name, profile, seed, sos_count=1)
+    if r.skipped:
+        return ScenarioResult(name=name, delivered_event_ids=[],
+                              log_path=r.log_path, gateway_mode="cli",
+                              chaos_report_path=r.report_path or None,
+                              chaos_skipped=r.skipped)
+    inv = r.report["invariants"]
+    return ScenarioResult(
+        name=name, delivered_event_ids=sorted(r.gateway_events.keys()),
+        log_path=r.log_path, gateway_mode="cli",
+        sos_event_id=(r.sos_event_ids[0] if r.sos_event_ids else None),
+        accepted_event_ids=sorted(r.gateway_events.keys()),
+        chaos_report_path=r.report_path,
+        chaos_sos_delivered=inv["sos_delivered"],
+        chaos_no_dup=inv["no_duplicate_canonical"],
+        chaos_retransmitted=inv["nodeA_retransmitted"],
+        chaos_sos_ratio=inv["sos_delivery_ratio"],
     )
 
 
