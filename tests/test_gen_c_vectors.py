@@ -34,7 +34,8 @@ def _app_dir() -> Path:
 
 def _load(name: str) -> dict:
     path = _app_dir() / "docs" / "specs" / name
-    return json.load(io.open(path, encoding="utf-8"))
+    with io.open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 # The closed §8.1 LORA-WIRE drop_reason vocabulary (lora_wire_v1.md §8.1).
