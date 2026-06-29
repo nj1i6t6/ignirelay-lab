@@ -76,6 +76,7 @@ SCENARIO_PORT_BASE = {
     "partition_heal": 40,
     "asymmetric_link": 60,
     "loss_20_realstack": 80,
+    "c4_live": 100,
 }
 
 # Backwards-compatible module aliases (the frozen B7 helpers reference these).
@@ -226,11 +227,16 @@ class LoRaUdpHub:
 
     def __init__(self, log: JsonlLogSink, ports: PortLayout = DEFAULT_PORTS,
                  profile: Optional[ChannelProfile] = None,
-                 rng: Optional[random.Random] = None) -> None:
+                 rng: Optional[random.Random] = None,
+                 live_out: Optional[Path] = None) -> None:
         self.log = log
         self.ports = ports
         self.profile = profile or ChannelProfile()
         self.rng = rng or random.Random(0)
+        # C4: when set, every tapped frame is appended to this JSONL the moment
+        # it is tapped (serial-stream model) so a `gateway ingest --follow`
+        # process picks it up live — not batched at the end of the run.
+        self.live_out = live_out
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((HUB_HOST, ports.hub_port))
@@ -293,8 +299,17 @@ class LoRaUdpHub:
 
     def _tap(self, frame: bytes, src_port: int) -> None:
         self._obs += 1
-        self.taps.append(TappedFrame(frame.hex(), self._node_label(src_port),
-                                     self._obs, src_port))
+        tf = TappedFrame(frame.hex(), self._node_label(src_port),
+                         self._obs, src_port)
+        self.taps.append(tf)
+        if self.live_out is not None:
+            # Append-and-flush per tap so the follow-ingest sees it immediately.
+            with self.live_out.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(
+                    {"frame_hex": tf.frame_hex,
+                     "last_hop_node_id": tf.last_hop_node_id,
+                     "observed_at_ms": tf.observed_at_ms}, sort_keys=True) + "\n")
+                fh.flush()
 
     def pump(self, duration_s: float, idle_quiesce_s: float = 0.4) -> None:
         """Route + tap frames until the medium is idle for idle_quiesce_s."""
@@ -737,3 +752,105 @@ def run_chaos_real_stack(name: str, profile: ChannelProfile, seed: int, *,
         feed_frame_counts=feed_counts, nodeA_retransmits=retransmits,
         nodeA_node_receipts=receipts,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# C4 — live producer: stream tapped frames to a JSONL while the real stack runs
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class StreamResult:
+    name: str
+    live_out: str
+    presence_event_id: str
+    sos_event_id: str
+    taps: int
+    skipped: Optional[str] = None
+
+
+def stream_e2e_real_stack(name: str = "c4_live", seed: int = 7, *,
+                          live_out: Optional[Path] = None,
+                          pump_s: float = 10.0) -> StreamResult:
+    """C4 live producer for the gateway follow-ingest pipeline.
+
+    Runs the SAME real-byte topology as `run_e2e_real_stack` (two real C node
+    executables + the LoRa UDP hub) and streams each tapped on-air frame to
+    `live_out` the instant it is tapped. Unlike `run_e2e_real_stack` this does
+    NOT batch-ingest at the end and does NOT do the NodeB-restart phase — it is
+    a pure live frame source; ingestion is the gateway's `ingest --follow` job.
+
+    Frames are byte-exact LORA-WIRE v1 (signed by the corpus TEST-ONLY field);
+    nothing here re-implements node logic or touches frozen contracts.
+    """
+    log = JsonlLogSink(name)
+    base_dir = Path("logs") / name
+    base_dir.mkdir(parents=True, exist_ok=True)
+    field_mat = fx.test_field()
+    secret_hex = field_mat.secret.hex()
+    ports = make_ports(SCENARIO_PORT_BASE.get(name, 100))
+
+    try:
+        exe = node_exe_path()
+    except NodeExeMissing as exc:
+        return StreamResult(name, "", "", "", 0, skipped=str(exc))
+
+    live_path = Path(live_out) if live_out is not None else None
+    if live_path is not None:
+        live_path.parent.mkdir(parents=True, exist_ok=True)
+        # Append-only: the feed is caller-owned (a live stream). Never truncate
+        # it — a follow-ingest may already be tailing and the caller may have
+        # written earlier frames (e.g. a HEARTBEAT) we must not erase.
+        if not live_path.exists():
+            live_path.write_text("", encoding="utf-8")
+
+    phone = FakePhone()
+    anon8 = phone.anon_user_id[:8]
+    presence = phone.presence(0)
+    sos = phone.sos(1)            # SOS_RED, safety=trapped(4)
+    nodeA_out = base_dir / "nodeA.out"
+    nodeB_out = base_dir / "nodeB.out"
+    for p in (nodeA_out, nodeB_out):
+        p.write_text("", encoding="utf-8")
+
+    hub = LoRaUdpHub(log, ports=ports, live_out=live_path)
+    node_a = NodeProcess(exe, 1, secret_hex, nodeA_out, ports=ports)
+    node_b = NodeProcess(exe, 2, secret_hex, nodeB_out, ports=ports)
+    try:
+        node_a.start()
+        node_b.start()
+        if not (node_a.wait_ready() and node_b.wait_ready()):
+            raise RuntimeError("node(s) failed to reach ready state")
+        # PRESENCE then SOS in one batch (SOS prio 1 emits before PRESENCE prio 3).
+        inject_ble(1, [(anon8, presence.envelope_bytes),
+                       (anon8, sos.envelope_bytes)], ports=ports)
+        hub.pump(duration_s=pump_s)
+    finally:
+        node_a.stop()
+        node_b.stop()
+        hub.close()
+
+    return StreamResult(
+        name=name, live_out=str(live_path) if live_path else "",
+        presence_event_id=presence.event_id_hex,
+        sos_event_id=sos.event_id_hex, taps=len(hub.taps),
+    )
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="C4 live producer: stream real-stack LoRa frames to a JSONL.")
+    ap.add_argument("--live-out", required=True,
+                    help="JSONL the gateway `ingest --follow` tails")
+    ap.add_argument("--name", default="c4_live")
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--pump-s", type=float, default=10.0)
+    args = ap.parse_args(argv)
+    result = stream_e2e_real_stack(args.name, args.seed,
+                                   live_out=Path(args.live_out),
+                                   pump_s=args.pump_s)
+    print(json.dumps(result.__dict__, sort_keys=True), flush=True)
+    return 2 if result.skipped else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
