@@ -340,3 +340,26 @@ DK build        EXIT_DK=0；FLASH 62564 B / 4.28%；static RAM 17184 B = 16.78 K
 - 硬體採購可依 B10 報告 §4 清單由 Owner 執行。
 
 **Stage B 結案：`STAGE-B-EXIT: PASS`（Owner-authorized @ 2026-06-29）。只宣稱 core protocol + firmware logic green；非實場驗證。**
+
+---
+
+## [2026-06-29] C4 — live-out support for real stack E2E DONE — 執行者：Claude（施工 AI，Owner 授權 C4）
+
+- repo/commit: ignirelay-lab code `c5ec34b`（`[C4] live-out support for real stack E2E`）／本 STATUS commit。**搭配 gateway `f3751bd`（`[C4] live gateway follow-ingest pipeline`）+ gateway `tests/test_live_pipeline.py`。**
+- 任務性質: **僅 C4（為 gateway follow-ingest 提供 live 幀源）**——拓樸與 B7/B8 相同（兩顆真 C node bsim exe + LoRa UDP hub）；**未改凍結 B7 `run_e2e_real_stack` / B8 chaos 路徑、LORA-WIRE、vectors、B1 契約**。未開 C5/C7、未宣稱 Stage C Exit。
+- 改動檔（1）：`ignirelay_lab/e2e_real_stack.py`。
+
+### 交付
+- `LoRaUdpHub` 新增可選 `live_out` 路徑：設定後每個被 tap 的真 on-air frame 在 tap 當下即 append-and-flush 到該 JSONL（serial-stream 模型），供 gateway `ingest --follow` 即時撈取。預設 None＝零行為變更（B7/B8 仍走 `gateway_feed()` 批次）。
+- `stream_e2e_real_stack()`：聚焦 live producer——跑真兩節點拓樸、把 taps 串到 live_out，**不**做批次 ingest、**不**做 NodeB-restart。**append-only**（不 truncate caller-owned feed——follow-ingest 可能已在 tail，且 caller 可能先寫了 HEARTBEAT，不可抹掉）。
+- `python -m ignirelay_lab.e2e_real_stack --live-out <jsonl>` CLI 入口；新增 `c4_live` port base（與 B7/B8 情境 port 互斥）。
+
+### 驗證（G17）
+- **GATE-SCEN（Windows）**：`python -m ignirelay_lab.cli --all` → **13/13 PASS、exit 0**（e2e/chaos 在無 bsim exe 時 skip，與既往一致；本刀未改其路徑）。
+- **lab unittest（Windows）**：`python -m unittest discover -s tests` → OK（既有測試全綠）。
+- **C4 live 端到端（WSL2，真 bsim）**：由 gateway `tests/test_live_pipeline.py` 跨 repo 驅動本 producer——standalone producer 證據 `taps=4`、nodeA.out 有 SOS/PRESENCE 的 `LORA_TX`；接上 gateway follow-ingest 後 **SOS feed→API latency 132.1/134.3 ms（<5000，兩次重現）**。
+- 修一個自身 bug：初版 `stream_e2e_real_stack` truncate live-out 檔（抹掉 caller 先寫的 HEARTBEAT 行 + 使 follow 讀取位移失準）→ 改 append-only，重現綠。
+
+### caveat / next
+- 純 bsim native 模擬（與 Stage B 同口徑，未上硬體、零 RF 實測）。
+- 下一棒＝Owner/Codex 審查 C4（gateway + lab 一起）。施工 AI 不自行開 C5/C7。
