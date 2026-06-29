@@ -288,3 +288,55 @@ python -m unittest discover -s tests (GATE-LAB)         -> exit 0  ->  Ran 55 OK
 - 紅線: 未碰 App / gateway frozen contracts 與 corpus/vectors（App + gateway working tree 全程 0 changed）；
   **跑真 B6 C 執行檔，未用 Python 重新實作 node 取代**；secret 僅 TEST-ONLY 不入版控；
   **只記 B8 DONE，未宣稱 Stage B DONE / STAGE-B-EXIT，未進 B9**。caveat：純編譯 + bsim native 模擬（無硬體）。
+
+---
+
+## [2026-06-29] STAGE-B-EXIT: PASS — Stage B（模擬器優先）總出口（Owner 授權）
+
+> **MASTER §6.11 Stage B Exit。** Owner 2026-06-29 獨立複核 B1–B10（含 B10-A 補件）後**明示授權**記此出口（lab repo 為 §6.11 指定的彙整點）。
+> **明文限制（§6.11 / PHASE3 §5）**：此處**只**宣稱 **「core protocol and firmware logic are green」**。
+> **不**宣稱任何實場 / RF / 距離 / 續航效能——Stage B 全程＝**模擬器（bsim native）+ DK 交叉編譯**，**零實機燒錄、零 RF 實測**。
+
+### 判定
+**B1–B10 全 DONE → `STAGE-B-EXIT: PASS`。** B10 採購 gate 18/18 PASS（B10-A 補件後）。Stage D 入場條件（B10 DONE）已滿足。
+
+### B1–B10 證據彙整（四 sibling repo；code / STATUS commit 皆對 git log 核對）
+| 階段 | 內容 | repo @ commit |
+|---|---|---|
+| B1 | 凍結 LORA-WIRE v1 + node provisioning + vectors/generator | App `f207194` / STATUS `775d894` |
+| B2 | Python reference（envelope_v3 + lora_v1 + keys，吃 App corpus/vectors） | lab `4cc1e5f` / `8e08aa0` |
+| B3 | lab scenarios 全跑真 envelope / 真 LoRa bytes | lab `00a480b` / `30284e3` |
+| B4 | gateway 真驗 MAC/CRC/replay/ttl + SQLite canonical/dedupe | gateway `aa70db5` / `7bb07be` ＋ lab E2E `ffd79dc` / `a188423` |
+| B5 | WSL2 + NCS v3.3.1 / Zephyr / bsim 環境（ENV-GATE）；DK+bsim build 綠 | field-node `27763da` / `3cd50e2`（handoff `b6cc240`） |
+| B6 | field-node C codec/crypto/core/node pipeline + ztest + PSA/fiat Ed25519 | field-node `0817245` / `56d5f32` ＋ follow-up `ed31b1e` / `d8252f3` ＋ lab gen `35aed3f` / `bb8bca3` |
+| B7 | real-stack E2E：2 個真 C node 執行檔 + UDP hub + 真 gateway，5 斷言 | field-node `4b33257` / `93f399b` ＋ lab `c38a071` / `497943f` |
+| B8 | chaos 全綠（loss_50 / partition_heal / asymmetric_link；真重送 ≤3） | field-node `c4f2e4d` / `f34bd5b` ＋ lab `b0c3107` / `2071c96` |
+| B9 | nRF54L15 DK target cross-build + RAM gate（資源寬裕） | field-node `41a4fae`（STATUS-only） |
+| B10 | 硬體採購 gate 報告（PHASE3 §9 逐項） | App `886d57d`（報告）/ `59280af`（STATUS） |
+| B10-A | 採購前設計補齊（SX1262 devicetree / AS923 radio profile / 持久化政策）→ §9 18/18 PASS | App `9ddf856` ＋ field-node `a8eec48` |
+
+### 跨階段 gate 旁證（出口前最後彙整）
+```
+GATE-SCEN  lab  python -m ignirelay_lab.cli --all          -> exit 0  -> 13/13 PASS
+GATE-LAB   lab  python -m unittest discover -s tests        -> exit 0  -> Ran 55 OK
+GATE-GW    gw   python -m unittest discover -s tests        -> exit 0  -> Ran 26 OK（B4 未動）
+field-node      4 build EXIT=0、core ztest 16/16、wire ztest 12/12、D5 grep 0
+DK build        EXIT_DK=0；FLASH 62564 B / 4.28%；static RAM 17184 B = 16.78 KB < 160 KB；remaining ≥ 64 KB
+20% loss        SOS 送達 100%（real-stack 6/6 跨 5 seed）；50% loss SOS 最終送達 + 無重複
+```
+
+### Stage D carry-forward（已知風險，明文帶往下一階段，不埋）
+1. **dwell-time / radio profile（D5 場試前處理）**：70B SOS 全幀在 AS923 若有 **400 ms dwell** 限制 → **SF9 ≈ 411 ms（marginal，僅超 ~11 ms 且為公式值非實測）、SF10 ≈ 780 ms（明確超標）**。處置順序：(a) **先確認台灣 NCC 920–925 低功率是否有 per-packet dwell** —— 若為純 duty-cycle 制則疑慮消失；(b) MVP 用 **SF8/BW125 ≈ 226 ms** 安全且不動契約；(c) 要更遠 → **mesh relay 多跳**（架構本有的距離槓桿）或 **G6 把 SOS 全幀 ≤ 64 B**（解鎖 SF9 ≈ 390 ms）。詳 App `docs/specs/lora_radio_profile_as923_v1_draft.md`。
+2. **真 SX1262 驅動 + 真 GATT server + flash 持久化**：皆 Stage D bring-up 實作（設計/政策已於 B10-A 寫定：`sx1262_pinout_devicetree_plan.md`、`node_persistence_policy.md`）。
+3. **SOS 70B > 64B 既知偏差**：訊框層已聲明（`lora_wire_v1.md` §9）；電波層（dwell）放大其成本，G6 瘦身可一併解。
+
+### 限制 / caveat（誠實，務必隨出口宣告轉達）
+- 純編譯 + bsim native 模擬 + DK 交叉編譯；**未燒錄、未上硬體、零 RF 實測、零 field performance claim**。
+- 10-node storm = actor 級模擬（非 10 台真節點）；node reboot 不產生重複靠 **gateway event_id 去重**保證（非 node flash 持久化，後者 Stage D 實作）。
+- 三份 B10-A 設計交付為 **DRAFT**，其實作屬 Stage D。
+
+### next
+- **Stage C（Web 管理端）/ C1 起跑——由 Owner 另開新對話處理**（本 session 不接 C）。
+- 硬體採購可依 B10 報告 §4 清單由 Owner 執行。
+
+**Stage B 結案：`STAGE-B-EXIT: PASS`（Owner-authorized @ 2026-06-29）。只宣稱 core protocol + firmware logic green；非實場驗證。**
