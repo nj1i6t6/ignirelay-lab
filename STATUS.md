@@ -363,3 +363,14 @@ DK build        EXIT_DK=0；FLASH 62564 B / 4.28%；static RAM 17184 B = 16.78 K
 ### caveat / next
 - 純 bsim native 模擬（與 Stage B 同口徑，未上硬體、零 RF 實測）。
 - 下一棒＝Owner/Codex 審查 C4（gateway + lab 一起）。施工 AI 不自行開 C5/C7。
+
+
+## [2026-09-05] W0 v1.2 cross-repo validation checkpoint @ a80c7db
+
+- Record shared fixtures/interpreter checks alongside accepted W1 checkpoints (App e8f0e71 / Gateway 80b6d05), App baseline 8f05f6b and Node baseline 67efba1.
+- Independent Lab W0 suite: 5 passed, including Ed25519 verification, frozen C numbers and generated-case stale check. Full Lab/live C4 was not rerun during this W1 review.
+- N1/N2/C1 remain open. Contract test success does not approve node production behavior or physical RF links.
+
+### Current State (2026-09-05)
+
+W1 prerequisite test baseline recorded. Subsequent integration/hardware verification remains pending. Local checkpoint only; no remote push.
