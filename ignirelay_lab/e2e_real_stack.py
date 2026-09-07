@@ -144,8 +144,10 @@ class NodeProcess:
         self.ports = ports
         self.proc: Optional[subprocess.Popen] = None
         self._out = None
+        self.start_offset = 0
 
     def start(self) -> None:
+        self.start_offset = self.out_path.stat().st_size if self.out_path.exists() else 0
         self._out = self.out_path.open("ab")
         # nrf_bsim native runner registers options as single-dash `-opt=value`
         # (native_add_command_line_opts); GNU `--opt value` is rejected.
@@ -156,6 +158,7 @@ class NodeProcess:
             f"-node-port={self.ports.node_ports[self.node_id]}",
             f"-ble-port={self.ports.ble_ports[self.node_id]}",
             f"-field-secret={self.secret_hex}",
+            f"-storage-file={self.out_path.parent / f'node_{self.node_id}.journal'}",
         ]
         self.proc = subprocess.Popen(args, stdout=self._out,
                                      stderr=subprocess.STDOUT)
@@ -164,12 +167,18 @@ class NodeProcess:
         deadline = time.time() + timeout_s
         token = f"node {self.node_id} ready on hub"
         while time.time() < deadline:
-            if self.out_path.exists() and token in self.out_path.read_text(
-                    encoding="utf-8", errors="replace"):
-                return True
+            if self.out_path.exists():
+                try:
+                    with self.out_path.open("rb") as f:
+                        f.seek(self.start_offset)
+                        tail = f.read().decode("utf-8", errors="replace")
+                        if token in tail:
+                            return True
+                except OSError:
+                    pass
             if self.proc is not None and self.proc.poll() is not None:
                 return False
-            time.sleep(0.05)
+            time.sleep(0.01)
         return False
 
     def stop(self) -> None:
@@ -186,6 +195,21 @@ class NodeProcess:
 
     def stdout_text(self) -> str:
         return self.out_path.read_text(encoding="utf-8", errors="replace")
+
+
+def drain_udp(sock: socket.socket) -> int:
+    old_to = sock.gettimeout()
+    sock.setblocking(False)
+    drained = 0
+    try:
+        while True:
+            sock.recvfrom(4096)
+            drained += 1
+    except (BlockingIOError, socket.error):
+        pass
+    finally:
+        sock.settimeout(old_to)
+    return drained
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,8 +437,9 @@ def _run_gateway(gateway_dir: Path, db_path: Path, config_path: Path,
     cmd = [sys.executable, "-m", "ignirelay_gateway.cli",
            "--db", str(db_path.resolve()),
            "--config", str(config_path.resolve()), *args]
-    subprocess.run(cmd, cwd=gateway_dir, check=True, capture_output=True,
-                   text=True)
+    res = subprocess.run(cmd, cwd=gateway_dir, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"gateway failed ({res.returncode}):\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
 
 
 def ingest_feed(base_dir: Path, feed: list[dict]) -> dict[str, dict]:
@@ -510,11 +535,13 @@ def run_e2e_real_stack(name: str = "e2e_real_stack",
         return E2EResult(name, str(log.path), "", "", {}, {}, [], {}, 0, "", "",
                          skipped=str(exc))
 
-    # Fresh gateway DB / feed for this run.
+    # Fresh gateway DB / feed / node journals for this run.
     for f in ("gateway.sqlite", "gateway_feed.jsonl", "gateway_feed_slice.jsonl"):
         p = base_dir / f
         if p.exists():
             p.unlink()
+    for p in base_dir.glob("*.journal"):
+        p.unlink()
 
     phone = FakePhone()
     anon8 = phone.anon_user_id[:8]
@@ -634,10 +661,13 @@ def run_chaos_real_stack(name: str, profile: ChannelProfile, seed: int, *,
     except NodeExeMissing as exc:
         return _skip(str(exc))
 
+    # Fresh gateway DB / feed / node journals for this run.
     for f in ("gateway.sqlite", "gateway_feed.jsonl", "gateway_feed_slice.jsonl"):
         p = base_dir / f
         if p.exists():
             p.unlink()
+    for p in base_dir.glob("*.journal"):
+        p.unlink()
 
     rng = random.Random(seed)
     phone = FakePhone()
